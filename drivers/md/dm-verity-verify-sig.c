@@ -9,6 +9,7 @@
 #include <linux/verification.h>
 #include <keys/user-type.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include "dm-verity.h"
 #include "dm-verity-verify-sig.h"
 
@@ -64,6 +65,52 @@ end:
 	return ret;
 }
 
+static int verity_verify_get_sig_from_fdt(const char *key_desc,
+					  struct dm_verity_sig_opts *sig_opts)
+{
+	struct device_node *node;
+	char *path, *name, *str;
+	struct property *prop;
+	int ret = 0;
+
+	str = kstrdup(key_desc, GFP_KERNEL);
+	if (!str)
+		return -ENOMEM;
+
+	path = strsep(&str, ":");
+	name = str;
+
+	if (!path || !name) {
+		ret = -EINVAL;
+		goto end;
+	}
+
+	node = of_find_node_by_path(path);
+	if (!node) {
+		ret = -ENOENT;
+		goto end;
+	}
+
+	prop = of_find_property(node, name, NULL);
+	if (!prop) {
+		ret = -ENOENT;
+		goto end;
+	}
+
+	sig_opts->sig = kmalloc(prop->length, GFP_KERNEL);
+	if (!sig_opts->sig) {
+		ret = -ENOMEM;
+		goto end;
+	}
+
+	memcpy(sig_opts->sig, prop->value, prop->length);
+	sig_opts->sig_size = prop->length;
+
+end:
+	kfree(str);
+	return ret;
+}
+
 int verity_verify_sig_parse_opt_args(struct dm_arg_set *as,
 				     struct dm_verity *v,
 				     struct dm_verity_sig_opts *sig_opts,
@@ -82,7 +129,11 @@ int verity_verify_sig_parse_opt_args(struct dm_arg_set *as,
 	sig_key = dm_shift_arg(as);
 	(*argc)--;
 
-	ret = verity_verify_get_sig_from_key(sig_key, sig_opts);
+	if (sig_key[0] == '/') /* this is a fdt path */
+		ret = verity_verify_get_sig_from_fdt(sig_key, sig_opts);
+	else
+		ret = verity_verify_get_sig_from_key(sig_key, sig_opts);
+
 	if (ret < 0)
 		ti->error = DM_VERITY_VERIFY_ERR("Invalid key specified");
 
