@@ -23,7 +23,7 @@
 #define VDBGH	"VenusHigh: "
 #define VDBGFW	"VenusFW  : "
 
-#define VIDC_CLKS_NUM_MAX		4
+#define VIDC_CLKS_NUM_MAX		7
 #define VIDC_VCODEC_CLKS_NUM_MAX	2
 #define VIDC_RESETS_NUM_MAX		2
 #define VIDC_MAX_HIER_CODING_LAYER 6
@@ -525,6 +525,7 @@ struct venus_inst {
 #define IS_IRIS1(core)		((core)->res->vpu_version == VPU_VERSION_IRIS1)
 #define IS_IRIS2(core)		((core)->res->vpu_version == VPU_VERSION_IRIS2)
 #define IS_IRIS2_1(core)	((core)->res->vpu_version == VPU_VERSION_IRIS2_1)
+
 
 #define ctrl_to_inst(ctrl)	\
 	container_of((ctrl)->handler, struct venus_inst, ctrl_handler)
