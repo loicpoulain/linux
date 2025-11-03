@@ -8,6 +8,7 @@ menu "Qualcomm firmware drivers"
 
 config QCOM_SCM
 	select QCOM_TZMEM
+	select REBOOT_MODE
 	tristate
 
 config QCOM_TZMEM
