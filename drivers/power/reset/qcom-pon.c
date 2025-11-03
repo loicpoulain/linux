@@ -19,6 +19,13 @@
 
 #define NO_REASON_SHIFT			0
 
+#define PON_SW_RESET_S2_CTL				0x62
+#define		PON_SW_RESET_S2_CTL_WARM_RST	0x01
+#define PON_SW_RESET_S2_CTL2				0x63
+#define		PON_SW_RESET_S2_CTL2_RST_EN	BIT(7)
+#define PON_SW_RESET_GO					0x64
+#define		PON_SW_RESET_GO_MAGIC		0xa5
+
 struct qcom_pon {
 	struct device *dev;
 	struct regmap *regmap;
@@ -42,6 +49,35 @@ static int qcom_pon_reboot_mode_write(struct reboot_mode_driver *reboot,
 		dev_err(pon->dev, "update reboot mode bits failed\n");
 
 	return ret;
+}
+
+static int pm8916_pon_reset(struct sys_off_data *data)
+{
+	struct qcom_pon *pon = data->cb_data;
+	int ret;
+
+	if (data->mode != REBOOT_WARM)
+		return NOTIFY_DONE;
+
+	ret = regmap_write(pon->regmap,
+			   pon->baseaddr + PON_SW_RESET_S2_CTL,
+			   PON_SW_RESET_S2_CTL_WARM_RST);
+	if (ret)
+		return NOTIFY_BAD;
+
+	ret = regmap_update_bits(pon->regmap,
+				 pon->baseaddr + PON_SW_RESET_S2_CTL2,
+				 PON_SW_RESET_S2_CTL2_RST_EN,
+				 PON_SW_RESET_S2_CTL2_RST_EN);
+	if (ret)
+		return NOTIFY_BAD;
+
+	ret = regmap_write(pon->regmap, pon->baseaddr + PON_SW_RESET_GO,
+			   PON_SW_RESET_GO_MAGIC);
+	if (ret)
+		return NOTIFY_BAD;
+
+	return NOTIFY_DONE;
 }
 
 static int qcom_pon_probe(struct platform_device *pdev)
@@ -81,6 +117,11 @@ static int qcom_pon_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, pon);
+
+	error = devm_register_sys_off_handler(&pdev->dev, SYS_OFF_MODE_RESTART,
+					      SYS_OFF_PRIO_DEFAULT, pm8916_pon_reset, pon);
+	if (error)
+		return dev_err_probe(&pdev->dev, error, "reboot registration fail\n");
 
 	return devm_of_platform_populate(&pdev->dev);
 }
