@@ -306,11 +306,27 @@ static int get_set_conduit_method(const struct device_node *np)
 	return 0;
 }
 
+static int psci_sys_reset_cold(struct notifier_block *nb, unsigned long action,
+                               void *data)
+{
+        invoke_psci_fn(PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0);
+
+	return NOTIFY_DONE;
+}
+
+/* cold reset as the last resort */
+static struct notifier_block psci_sys_reset_fallback_nb = {
+        .notifier_call = psci_sys_reset_cold,
+        .priority = SYS_OFF_PRIO_LOW,
+};
+
 static int psci_sys_reset(struct notifier_block *nb, unsigned long action,
 			  void *data)
 {
-	if ((reboot_mode == REBOOT_WARM || reboot_mode == REBOOT_SOFT) &&
-	    psci_system_reset2_supported) {
+	if ((reboot_mode == REBOOT_WARM || reboot_mode == REBOOT_SOFT)) {
+		if (!psci_system_reset2_supported)
+			return NOTIFY_DONE;
+
 		/*
 		 * reset_type[31] = 0 (architectural)
 		 * reset_type[30:0] = 0 (SYSTEM_WARM_RESET)
@@ -318,7 +334,7 @@ static int psci_sys_reset(struct notifier_block *nb, unsigned long action,
 		 */
 		invoke_psci_fn(PSCI_FN_NATIVE(1_1, SYSTEM_RESET2), 0, 0, 0);
 	} else {
-		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_RESET, 0, 0, 0);
+		return psci_sys_reset_cold(nb, action, data);
 	}
 
 	return NOTIFY_DONE;
@@ -670,6 +686,7 @@ static void __init psci_0_2_set_functions(void)
 	};
 
 	register_restart_handler(&psci_sys_reset_nb);
+	register_restart_handler(&psci_sys_reset_fallback_nb);
 
 	pm_power_off = psci_sys_poweroff;
 }
