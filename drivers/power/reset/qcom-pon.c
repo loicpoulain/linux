@@ -122,7 +122,7 @@ static int qcom_pon_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, pon);
 
 	error = devm_register_sys_off_handler(&pdev->dev, SYS_OFF_MODE_RESTART,
-					      SYS_OFF_PRIO_DEFAULT, pm8916_pon_reset, pon);
+					      SYS_OFF_PRIO_DEFAULT + 1, pm8916_pon_reset, pon);
 	if (error)
 		return dev_err_probe(&pdev->dev, error, "reboot registration fail\n");
 
