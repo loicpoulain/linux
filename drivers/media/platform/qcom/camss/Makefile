@@ -30,6 +30,9 @@ qcom-camss-objs += \
 
 obj-$(CONFIG_VIDEO_QCOM_CAMSS) += qcom-camss.o
 
-qcom-camss-ope-objs += camss-ope.o
+qcom-camss-ope-objs += \
+		camss-ope.o \
+		camss-isp-m2m.o \
+		camss-isp-params.o
 
-obj-$(CONFIG_VIDEO_QCOM_CAMSS) += qcom-camss-ope.o
+obj-$(CONFIG_VIDEO_QCOM_CAMSS_OPE) += qcom-camss-ope.o
