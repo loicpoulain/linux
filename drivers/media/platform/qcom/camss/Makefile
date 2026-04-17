@@ -29,3 +29,13 @@ qcom-camss-objs += \
 		camss-format.o \
 
 obj-$(CONFIG_VIDEO_QCOM_CAMSS) += qcom-camss.o
+
+qcom-camss-ope-objs += \
+		camss-isp-ope.o \
+		camss-isp-params.o
+
+qcom-camss-ope-objs += camss-isp-bufq.o
+
+obj-$(CONFIG_VIDEO_QCOM_CAMSS_OPE) += qcom-camss-ope.o
+qcom-camss-ope-objs += camss-isp-pipeline.o
+qcom-camss-ope-objs += camss-isp-sched.o
