@@ -582,6 +582,7 @@ static bool blk_add_partition(struct gendisk *disk,
 	if (state->parts[p].np) {
 		device_set_node(&part->bd_device,
 				of_fwnode_handle(state->parts[p].np));
+		blk_nvmem_add(part);
 	}
 
 	if (IS_BUILTIN(CONFIG_BLK_DEV_MD) &&
