@@ -80,6 +80,7 @@ struct ope_fmt {
 	unsigned int	depth;
 	unsigned int	align;
 	unsigned int	num_planes;
+	u32		mbus_code;
 };
 
 /* Per-queue format state */
@@ -87,6 +88,7 @@ struct ope_fmt_state {
 	const struct ope_fmt	*fmt;
 	unsigned int		width;
 	unsigned int		height;
+	struct v4l2_rect	crop;
 	unsigned int		bytesperline;
 	unsigned int		sizeimage;
 	enum v4l2_colorspace	colorspace;
@@ -157,7 +159,7 @@ struct ope_fmt_state {
 #define OPE_BUS_WR_CLIENT_IMAGE_CFG_1(c)			(0x210 + (c) * 0x100)
 #define OPE_BUS_WR_CLIENT_IMAGE_CFG_2(c)			(0x214 + (c) * 0x100)
 #define OPE_BUS_WR_CLIENT_PACKER_CFG(c)				(0x218 + (c) * 0x100)
-#define OPE_BUS_WR_CLIENT_MAX	8
+#define OPE_BUS_WR_CLIENT_MAX	4
 
 /* Pipeline modules */
 #define OPE_PP_CLC_WB_GAIN_MODULE_CFG				(0x200 + 0x60)
@@ -277,15 +279,6 @@ struct ope_fmt_state {
 	 ((out) * 8   <= (in)) ? 0x2 : 0x3)
 #define DS_OUTPUT_PIX(in, phase_init, phase_step) \
 	((Q21(in) - (phase_init)) / (phase_step))
-/*
- * DS_SCALER_COUNT: actual pixel count produced by the MN scaler for @in
- * input pixels with the given @phase_step (phase_init assumed 0).
- * Empirically the chroma scaler delivers ceil(Q21(in) / phase_step) pixels.
- * This equals (Q21(in) + phase_step - 1) / phase_step.
- */
-#define DS_SCALER_COUNT(in, phase_step) \
-	((Q21(in) + (phase_step) - 1) / (phase_step))
-
 #define OPE_WB(n, d)		(((n) << 10) / (d))
 
 enum ope_downscaler {
@@ -306,7 +299,6 @@ enum ope_wr_client {
 	OPE_WR_CLIENT_VID_C,
 	OPE_WR_CLIENT_DISP_Y,
 	OPE_WR_CLIENT_DISP_C,
-	OPE_WR_CLIENT_ARGB,
 	OPE_WR_CLIENT_MAX,
 };
 
@@ -337,7 +329,6 @@ enum ope_unpacker_format {
 enum ope_packer_format {
 	OPE_PACKER_FMT_PLAIN_8		= 1,
 	OPE_PACKER_FMT_PLAIN_8_ODD_EVEN = 2,
-	OPE_PACKER_FMT_PLAIN_64		= 10,
 	OPE_PACKER_FMT_MIPI_10		= 12,
 };
 
@@ -393,47 +384,55 @@ static const struct ope_hw_fmt *ope_find_hw_fmt(u32 fourcc)
 }
 
 static const struct ope_fmt ope_input_fmts[] = {
-	{ V4L2_PIX_FMT_SBGGR10P, 10, 2, 1 },
-	{ V4L2_PIX_FMT_SGBRG10P, 10, 2, 1 },
-	{ V4L2_PIX_FMT_SGRBG10P, 10, 2, 1 },
-	{ V4L2_PIX_FMT_SRGGB10P, 10, 2, 1 },
-	{ V4L2_PIX_FMT_SRGGB8,    8, 0, 1 },
-	{ V4L2_PIX_FMT_SBGGR8,    8, 0, 1 },
-	{ V4L2_PIX_FMT_SGBRG8,    8, 0, 1 },
-	{ V4L2_PIX_FMT_SGRBG8,    8, 0, 1 },
+	{ V4L2_PIX_FMT_SBGGR10P, 10, 2, 1, MEDIA_BUS_FMT_SBGGR10_1X10 },
+	{ V4L2_PIX_FMT_SGBRG10P, 10, 2, 1, MEDIA_BUS_FMT_SGBRG10_1X10 },
+	{ V4L2_PIX_FMT_SGRBG10P, 10, 2, 1, MEDIA_BUS_FMT_SGRBG10_1X10 },
+	{ V4L2_PIX_FMT_SRGGB10P, 10, 2, 1, MEDIA_BUS_FMT_SRGGB10_1X10 },
+	{ V4L2_PIX_FMT_SRGGB8,    8, 0, 1, MEDIA_BUS_FMT_SRGGB8_1X8 },
+	{ V4L2_PIX_FMT_SBGGR8,    8, 0, 1, MEDIA_BUS_FMT_SBGGR8_1X8 },
+	{ V4L2_PIX_FMT_SGBRG8,    8, 0, 1, MEDIA_BUS_FMT_SGBRG8_1X8 },
+	{ V4L2_PIX_FMT_SGRBG8,    8, 0, 1, MEDIA_BUS_FMT_SGRBG8_1X8 },
 };
 
 static const struct ope_fmt ope_output_fmts[] = {
-	{ V4L2_PIX_FMT_NV24,  24, 0, 1 },
-	{ V4L2_PIX_FMT_NV42,  24, 0, 1 },
-	{ V4L2_PIX_FMT_NV16,  16, 1, 1 },
-	{ V4L2_PIX_FMT_NV61,  16, 1, 1 },
-	{ V4L2_PIX_FMT_NV12,  12, 1, 1 },
-	{ V4L2_PIX_FMT_NV21,  12, 1, 1 },
-	{ V4L2_PIX_FMT_GREY,   8, 0, 1 },
+	{ V4L2_PIX_FMT_NV24,  24, 0, 1, MEDIA_BUS_FMT_YUV8_1X24 },
+	{ V4L2_PIX_FMT_NV42,  24, 0, 1, MEDIA_BUS_FMT_YUV8_1X24 },
+	{ V4L2_PIX_FMT_NV16,  16, 1, 1, MEDIA_BUS_FMT_YUYV8_2X8 },
+	{ V4L2_PIX_FMT_NV61,  16, 1, 1, MEDIA_BUS_FMT_YUYV8_2X8 },
+	{ V4L2_PIX_FMT_NV12,  12, 1, 1, MEDIA_BUS_FMT_YUYV8_1_5X8 },
+	{ V4L2_PIX_FMT_NV21,  12, 1, 1, MEDIA_BUS_FMT_YUYV8_1_5X8 },
+	{ V4L2_PIX_FMT_GREY,   8, 0, 1, MEDIA_BUS_FMT_Y8_1X8 },
 };
 
 struct ope_dsc_config {
-	u32 input_width, input_height;
-	u32 output_width, output_height;
-	u32 phase_step_h, phase_step_v;
+	u32 input_width;
+	u32 input_height;
+	u32 output_width;
+	u32 output_height;
+	u32 phase_step_h;
+	u32 phase_step_v;
 	u32 crop_last_pixel;
 	u32 crop_last_line;
 };
 
 struct ope_stripe {
 	struct {
-		dma_addr_t		addr;
-		u32			width, height, stride;
+		dma_addr_t addr;
+		u32 width;
+		u32 height;
+		u32 stride;
 		enum ope_stripe_location location;
 		enum ope_pixel_pattern	pattern;
 		enum ope_unpacker_format format;
 	} src;
 	struct {
-		dma_addr_t		addr;
-		u32			width, height, stride, x_init;
-		enum ope_packer_format	format;
-		bool			enabled;
+		dma_addr_t addr;
+		u32 width;
+		u32 height;
+		u32 stride;
+		u32 x_init;
+		enum ope_packer_format format;
+		bool enabled;
 	} dst[OPE_WR_CLIENT_MAX];
 	struct ope_dsc_config dsc[OPE_DS_MAX];
 };
@@ -445,8 +444,8 @@ struct ope_stripe {
 
 struct ope_params_demo {
 	struct v4l2_isp_params_block_header header;
-	u8  lambda_rb;
-	u8  lambda_g;
+	u8 lambda_rb;
+	u8 lambda_g;
 	u16 a_k;
 	u16 w_k;
 	u16 _pad;
@@ -460,32 +459,38 @@ struct ope_config {
 	struct camss_params_color_correct color_correct;
 };
 
-enum ope_queue_idx {
-	OPE_QUEUE_FRAME_IN  = 0,
-	OPE_QUEUE_FRAME_OUT = 1,
-	OPE_QUEUE_PARAMS    = 2,
-	OPE_QUEUE_COUNT,
+enum ope_entity {
+	OPE_ENTITY_FRAME_IN,
+	OPE_ENTITY_PARAMS,
+	OPE_ENTITY_PROC,
+	OPE_ENTITY_DISP,
+	OPE_ENTITY_DISP_OUT,
+	OPE_ENTITY_COUNT
 };
 
-#define OPE_ENTITY_PROC	OPE_QUEUE_COUNT
+enum ope_queue_idx {
+	OPE_QUEUE_FRAME_IN,
+	OPE_QUEUE_DISP_OUT,
+	OPE_QUEUE_PARAMS,
+	OPE_QUEUE_COUNT
+};
 
 /* per-context state */
 struct ope_ctx {
 	struct camss_isp_bufq	*bufq;
 	struct camss_isp_job	job;
-
 	struct ope_dev		*ope;
 	struct mutex		vbq_lock;
+	struct vb2_queue	vqs[OPE_QUEUE_COUNT];
 
 	unsigned int		framerate;
-
 	struct ope_fmt_state	fmt_in;
 	struct ope_fmt_state	fmt_out;
+	u32			proc_mbus_code;
+	struct v4l2_rect	disp_compose;
 
 	struct list_head	list;
 	bool			started;
-
-	struct vb2_queue	vqs[OPE_QUEUE_COUNT];
 
 	struct ope_config	config;
 	u8			current_stripe;
@@ -599,19 +604,6 @@ static inline struct ope_stripe *ope_prev_stripe(struct ope_ctx *ctx,
 	return idx ? &ctx->stripe[idx - 1] : NULL;
 }
 
-static inline bool ope_pix_fmt_is_yuv(u32 fourcc)
-{
-	switch (fourcc) {
-	case V4L2_PIX_FMT_NV16: case V4L2_PIX_FMT_NV12:
-	case V4L2_PIX_FMT_NV24: case V4L2_PIX_FMT_NV61:
-	case V4L2_PIX_FMT_NV21: case V4L2_PIX_FMT_NV42:
-	case V4L2_PIX_FMT_GREY:
-		return true;
-	default:
-		return false;
-	}
-}
-
 static void ope_gen_stripe_chroma_dsc(struct ope_ctx *ctx,
 				      struct ope_stripe *stripe)
 {
@@ -622,11 +614,13 @@ static void ope_gen_stripe_chroma_dsc(struct ope_ctx *ctx,
 	dsc->input_height = stripe->src.height;
 
 	switch (dst_fourcc) {
-	case V4L2_PIX_FMT_NV61: case V4L2_PIX_FMT_NV16:
+	case V4L2_PIX_FMT_NV61:
+	case V4L2_PIX_FMT_NV16:
 		dsc->output_width  = dsc->input_width / 2;
 		dsc->output_height = dsc->input_height;
 		break;
-	case V4L2_PIX_FMT_NV12: case V4L2_PIX_FMT_NV21:
+	case V4L2_PIX_FMT_NV12:
+	case V4L2_PIX_FMT_NV21:
 		dsc->output_width  = dsc->input_width / 2;
 		dsc->output_height = dsc->input_height / 2;
 		break;
@@ -663,8 +657,7 @@ static void ope_gen_stripe_dsc(struct ope_ctx *ctx, struct ope_stripe *stripe,
 	dsc_y->output_width  = DS_OUTPUT_PIX(sw, 0, h_scale);
 	dsc_y->output_height = DS_OUTPUT_PIX(stripe->src.height, 0, v_scale);
 	dsc_c->output_width  = DS_OUTPUT_PIX(sw_c, 0, h_scale);
-	dsc_c->output_height = DS_OUTPUT_PIX(stripe->dsc[OPE_DS_C_PRE].output_height,
-					    0, v_scale);
+	dsc_c->output_height = DS_OUTPUT_PIX(stripe->dsc[OPE_DS_C_PRE].output_height, 0, v_scale);
 
 	dsc_y->crop_last_pixel = dsc_y->output_width  - 1;
 	dsc_y->crop_last_line  = dsc_y->output_height - 1;
@@ -672,15 +665,37 @@ static void ope_gen_stripe_dsc(struct ope_ctx *ctx, struct ope_stripe *stripe,
 	dsc_c->crop_last_line  = dsc_c->output_height - 1;
 }
 
-static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
-				   struct ope_stripe *stripe,
-				   dma_addr_t dst)
+static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx, struct ope_stripe *stripe, dma_addr_t dst)
 {
 	const struct ope_fmt_state *fo = &ctx->fmt_out;
 	unsigned int img_w = fo->width, img_h = fo->height;
 	const struct ope_hw_fmt *hw = ope_find_hw_fmt(fo->fmt->fourcc);
 	struct ope_stripe *prev = ope_prev_stripe(ctx, stripe);
-	u32 x_init = 0;
+	const struct v4l2_rect *compose = &ctx->disp_compose;
+	dma_addr_t y_base = dst + (u64)compose->top * img_w;
+	dma_addr_t c_base;
+	u32 x_init = compose->left;
+	u32 c_x_init;
+
+	switch (fo->fmt->fourcc) {
+	case V4L2_PIX_FMT_NV24:
+	case V4L2_PIX_FMT_NV42:
+		/* YUV444: C plane starts after Y plane; full-height, 2 bytes/luma-col */
+		c_base = dst + (u64)img_w * img_h + (u64)compose->top * img_w * 2;
+		c_x_init = compose->left * 2;
+		break;
+	case V4L2_PIX_FMT_NV16:
+	case V4L2_PIX_FMT_NV61:
+		/* YUV422: C plane = Y plane size; full-height, 1 byte/luma-col */
+		c_base = dst + (u64)img_w * img_h + (u64)compose->top * img_w;
+		c_x_init = compose->left;
+		break;
+	default:
+		/* YUV420 (NV12/NV21): C plane = Y/2 height, 1 byte/luma-col */
+		c_base = dst + (u64)img_w * img_h + (u64)(compose->top / 2) * img_w;
+		c_x_init = compose->left;
+		break;
+	}
 
 	stripe->dst[OPE_WR_CLIENT_DISP_Y].enabled = true;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].enabled = true;
@@ -690,7 +705,7 @@ static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
 		x_init = prev->dst[OPE_WR_CLIENT_DISP_Y].x_init +
 			 prev->dst[OPE_WR_CLIENT_DISP_Y].width;
 
-	stripe->dst[OPE_WR_CLIENT_DISP_Y].addr   = dst;
+	stripe->dst[OPE_WR_CLIENT_DISP_Y].addr   = y_base;
 	stripe->dst[OPE_WR_CLIENT_DISP_Y].x_init = x_init;
 	stripe->dst[OPE_WR_CLIENT_DISP_Y].width  = stripe->dsc[OPE_DS_Y_DISP].output_width;
 	stripe->dst[OPE_WR_CLIENT_DISP_Y].height = stripe->dsc[OPE_DS_Y_DISP].output_height;
@@ -698,18 +713,13 @@ static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
 	stripe->dst[OPE_WR_CLIENT_DISP_Y].format = OPE_PACKER_FMT_PLAIN_8;
 
 	/* UV plane */
-	x_init = 0;
+	x_init = c_x_init;
 	if (prev)
 		x_init = prev->dst[OPE_WR_CLIENT_DISP_C].x_init +
 			 prev->dst[OPE_WR_CLIENT_DISP_C].width;
 
-	stripe->dst[OPE_WR_CLIENT_DISP_C].addr   = dst + img_w * img_h;
+	stripe->dst[OPE_WR_CLIENT_DISP_C].addr   = c_base;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].x_init = x_init;
-	pr_debug("WE3_C: x_init=%u width=%u stride=%u sum=%u\n",
-		 x_init,
-		 stripe->dsc[OPE_DS_C_DISP].output_width * 2,
-		 img_w,
-		 x_init + stripe->dsc[OPE_DS_C_DISP].output_width * 2);
 	stripe->dst[OPE_WR_CLIENT_DISP_C].format = hw ? hw->packer : OPE_PACKER_FMT_PLAIN_8;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].width  = stripe->dsc[OPE_DS_C_DISP].output_width * 2;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].height = stripe->dsc[OPE_DS_C_DISP].output_height;
@@ -727,41 +737,21 @@ static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
 	}
 }
 
-static void ope_gen_stripe_argb_dst(struct ope_ctx *ctx, struct ope_stripe *stripe, dma_addr_t dst)
-{
-	unsigned int img_w = ctx->fmt_out.width;
-	dma_addr_t addr;
-
-	stripe->dst[OPE_WR_CLIENT_ARGB].enabled = true;
-
-	struct ope_stripe *prev = ope_prev_stripe(ctx, stripe);
-
-	if (prev)
-		addr = prev->dst[OPE_WR_CLIENT_ARGB].addr +
-		       prev->dst[OPE_WR_CLIENT_ARGB].width * 8;
-	else
-		addr = dst;
-
-	stripe->dst[OPE_WR_CLIENT_ARGB].addr   = addr;
-	stripe->dst[OPE_WR_CLIENT_ARGB].x_init = 0;
-	stripe->dst[OPE_WR_CLIENT_ARGB].width  = stripe->src.width;
-	stripe->dst[OPE_WR_CLIENT_ARGB].height = stripe->src.height;
-	stripe->dst[OPE_WR_CLIENT_ARGB].stride = img_w * 8;
-	stripe->dst[OPE_WR_CLIENT_ARGB].format = OPE_PACKER_FMT_PLAIN_64;
-}
-
 static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 {
 	const struct ope_fmt_state *fi = &ctx->fmt_in;
-	const struct ope_fmt_state *fo = &ctx->fmt_out;
+	const struct v4l2_rect *crop    = &fi->crop;
+	const struct v4l2_rect *compose = &ctx->disp_compose;
 	const struct ope_hw_fmt *src_hw = ope_find_hw_fmt(fi->fmt->fourcc);
 	unsigned int num_stripes, width, x_out, x_out_c, i;
 	u32 h_scale, v_scale;
 
-	width      = fi->width;
-	num_stripes = DIV_ROUND_UP(fi->width, OPE_STRIPE_MAX_W);
-	h_scale    = DS_Q21(fi->width,  fo->width);
-	v_scale    = DS_Q21(fi->height, fo->height);
+	/* Advance source pointer to the crop origin */
+	src += (u64)crop->top * fi->bytesperline + (u64)crop->left * fi->fmt->depth / 8;
+	width = crop->width;
+	num_stripes = DIV_ROUND_UP(crop->width, OPE_STRIPE_MAX_W);
+	h_scale = DS_Q21(crop->width,  compose->width);
+	v_scale = DS_Q21(crop->height, compose->height);
 
 	x_out = x_out_c = 0;
 
@@ -771,17 +761,16 @@ static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 
 		memset(stripe, 0, sizeof(*stripe));
 
-		stripe->src.addr     = src;
-		stripe->src.width    = width;
-		stripe->src.height   = fi->height;
-		stripe->src.stride   = fi->bytesperline;
+		stripe->src.addr = src;
+		stripe->src.width = width;
+		stripe->src.height = crop->height;
+		stripe->src.stride = fi->bytesperline;
 		stripe->src.location = ope_stripe_location(i, num_stripes);
-		stripe->src.pattern  = src_hw ? src_hw->pattern : 0;
-		stripe->src.format   = src_hw ? src_hw->unpacker : 0;
+		stripe->src.pattern = src_hw ? src_hw->pattern : 0;
+		stripe->src.format = src_hw ? src_hw->unpacker : 0;
 
 		/* Ensure last stripe is wide enough */
-		if (width > OPE_STRIPE_MAX_W &&
-		    width < OPE_STRIPE_MAX_W + OPE_STRIPE_MIN_W)
+		if (width > OPE_STRIPE_MAX_W && width < OPE_STRIPE_MAX_W + OPE_STRIPE_MIN_W)
 			stripe->src.width -= OPE_STRIPE_MIN_W * 2;
 
 		v4l_bound_align_image(&stripe->src.width,
@@ -791,43 +780,38 @@ static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 				      OPE_STRIPE_MIN_H, OPE_STRIPE_MAX_H,
 				      OPE_ALIGN_H, 0);
 
-		sw   = stripe->src.width;
+		sw = stripe->src.width;
 
 		width -= stripe->src.width;
-		src   += stripe->src.width * fi->fmt->depth / 8;
+		src += stripe->src.width * fi->fmt->depth / 8;
 
-		if (ope_pix_fmt_is_yuv(fo->fmt->fourcc)) {
-			/*
-			 * Last-stripe adjustment: grow the input width (up to the
-			 * available remaining input) until the scaler delivers at
-			 * least the remaining output pixels for both Y and C.
-			 * CROP_RND_CLAMP then clips the scaler output to exactly
-			 * the remaining pixels so the total sums to fo->width.
-			 */
-			if (ope_stripe_is_last(stripe)) {
-				unsigned int rem_y = fo->width       - x_out;
-				unsigned int rem_c = fo->width / 2   - x_out_c;
-				unsigned int s;
+		/*
+		 * Last-stripe adjustment: grow the input width (up to the
+		 * available remaining input) until the scaler delivers at
+		 * least the remaining output pixels for both Y and C.
+		 * CROP_RND_CLAMP then clips the scaler output to exactly
+		 * the remaining pixels so the total sums to fo->width.
+		 */
+		if (ope_stripe_is_last(stripe)) {
+			unsigned int rem_y = compose->width - x_out;
+			unsigned int rem_c = compose->width / 2 - x_out_c;
+			unsigned int s;
 
-				for (s = OPE_STRIPE_MIN_W; s <= sw; s += 2) {
-					if (DS_OUTPUT_PIX(s,     0, h_scale) >= rem_y &&
-					    DS_OUTPUT_PIX(s / 2, 0, h_scale) >= rem_c) {
-						stripe->src.width = s;
-						break;
-					}
+			for (s = OPE_STRIPE_MIN_W; s <= sw; s += 2) {
+				if (DS_OUTPUT_PIX(s, 0, h_scale) >= rem_y &&
+				    DS_OUTPUT_PIX(s / 2, 0, h_scale) >= rem_c) {
+					stripe->src.width = s;
+					break;
 				}
 			}
-
-			/* C_PRE must be computed after the width adjustment. */
-			ope_gen_stripe_chroma_dsc(ctx, stripe);
-			ope_gen_stripe_dsc(ctx, stripe, h_scale, v_scale);
-			ope_gen_stripe_yuv_dst(ctx, stripe, dst);
-			x_out   += stripe->dsc[OPE_DS_Y_DISP].output_width;
-			x_out_c += stripe->dsc[OPE_DS_C_DISP].output_width;
-		} else {
-			ope_gen_stripe_argb_dst(ctx, stripe, dst);
 		}
 
+		ope_gen_stripe_chroma_dsc(ctx, stripe);
+		ope_gen_stripe_dsc(ctx, stripe, h_scale, v_scale);
+		ope_gen_stripe_yuv_dst(ctx, stripe, dst);
+
+		x_out += stripe->dsc[OPE_DS_Y_DISP].output_width;
+		x_out_c += stripe->dsc[OPE_DS_C_DISP].output_width;
 
 		/* Width in bytes for the fetch engine */
 		stripe->src.width = stripe->src.width * fi->fmt->depth / 8;
@@ -964,11 +948,7 @@ static void ope_prog_color_correct(struct ope_ctx *ctx, bool force)
 		     FIELD_PREP(OPE_PP_CLC_CC_COEFF_M_CFG_M, cc->m));
 }
 
-
-
-
-static void ope_prog_crop_rnd_clamp(struct ope_dev *ope,
-				    const struct ope_stripe *stripe)
+static void ope_prog_crop_rnd_clamp(struct ope_dev *ope, const struct ope_stripe *stripe)
 {
 	static const u32 crop_bases[] = {
 		OPE_PP_CLC_CROP_RND_CLAMP_Y_DISP_BASE,
@@ -983,9 +963,9 @@ static void ope_prog_crop_rnd_clamp(struct ope_dev *ope,
 	for (j = 0; j < ARRAY_SIZE(crop_bases); j++) {
 		const struct ope_dsc_config *dsc = &stripe->dsc[ds_idx[j]];
 		u32 cbase = crop_bases[j];
+
 		if (!dsc->output_width || !dsc->output_height) {
-			ope_write_pp(ope,
-				     OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(cbase), 0);
+			ope_write_pp(ope,  OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(cbase), 0);
 			continue;
 		}
 
@@ -995,11 +975,9 @@ static void ope_prog_crop_rnd_clamp(struct ope_dev *ope,
 					dsc->crop_last_pixel));
 		ope_write_pp(ope, OPE_PP_CLC_CROP_RND_CLAMP_CROP_LINE_CFG(cbase),
 			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_FIRST, 0) |
-			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_LAST,
-					dsc->crop_last_line));
+			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_LAST, dsc->crop_last_line));
 		ope_write_pp(ope, OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(cbase),
-			     OPE_PP_CLC_CROP_RND_CLAMP_EN |
-			     OPE_PP_CLC_CROP_RND_CLAMP_CROP_EN);
+			     OPE_PP_CLC_CROP_RND_CLAMP_EN | OPE_PP_CLC_CROP_RND_CLAMP_CROP_EN);
 	}
 }
 
@@ -1184,7 +1162,7 @@ static bool ope_job_ready(void *priv)
 
 	return ctx->started &&
 	       camss_isp_bufq_num_ready(ctx->bufq, OPE_QUEUE_FRAME_IN)  >= 1 &&
-	       camss_isp_bufq_num_ready(ctx->bufq, OPE_QUEUE_FRAME_OUT) >= 1;
+	       camss_isp_bufq_num_ready(ctx->bufq, OPE_QUEUE_DISP_OUT) >= 1;
 }
 
 static void ope_job_finish(struct ope_ctx *ctx, enum vb2_buffer_state state)
@@ -1193,7 +1171,7 @@ static void ope_job_finish(struct ope_ctx *ctx, enum vb2_buffer_state state)
 	bool requeue = false;
 
 	src    = camss_isp_bufq_remove(ctx->bufq, OPE_QUEUE_FRAME_IN);
-	dst    = camss_isp_bufq_remove(ctx->bufq, OPE_QUEUE_FRAME_OUT);
+	dst    = camss_isp_bufq_remove(ctx->bufq, OPE_QUEUE_DISP_OUT);
 	params = camss_isp_bufq_remove(ctx->bufq, OPE_QUEUE_PARAMS);
 
 	if (dst) {
@@ -1234,7 +1212,7 @@ static void ope_run_job(void *priv, bool ctx_changed)
 	dma_addr_t src, dst;
 
 	src = ope_buf_dma_addr(ctx, OPE_QUEUE_FRAME_IN);
-	dst = ope_buf_dma_addr(ctx, OPE_QUEUE_FRAME_OUT);
+	dst = ope_buf_dma_addr(ctx, OPE_QUEUE_DISP_OUT);
 
 	if (!src || !dst) {
 		dev_warn(ope->dev, "Job cannot run, missing buffer\n");
@@ -1298,15 +1276,15 @@ static void ope_we_irq(struct ope_dev *ope, struct ope_ctx *ctx)
 
 	status = ope_read_wr(ope, OPE_BUS_WR_INPUT_IF_IRQ_STATUS_0);
 	ope_write_wr(ope, OPE_BUS_WR_INPUT_IF_IRQ_CLEAR_0, status);
-	ope_write_wr(ope, OPE_BUS_WR_INPUT_IF_IRQ_CMD,
-		     OPE_BUS_WR_INPUT_IF_IRQ_CMD_CLEAR);
+	ope_write_wr(ope, OPE_BUS_WR_INPUT_IF_IRQ_CMD, OPE_BUS_WR_INPUT_IF_IRQ_CMD_CLEAR);
 
 	if (!ctx)
 		return;
 
 	if (status & OPE_BUS_WR_INPUT_IF_IRQ_STATUS_0_CONS_VIOL) {
-		dev_err_ratelimited(ope->dev,
-			"Write Engine: configuration constraint violation\n");
+		u32 viol = ope_read_wr(ope, OPE_BUS_WR_VIOLATION_STATUS);
+
+		dev_err_ratelimited(ope->dev, "constraint violation (clients=0x%x)\n", viol);
 		ope_write(ctx->ope, OPE_TOP_RESET_CMD, OPE_TOP_RESET_CMD_SW);
 	}
 
@@ -1316,16 +1294,15 @@ static void ope_we_irq(struct ope_dev *ope, struct ope_ctx *ctx)
 
 		for (i = 0; i < OPE_WR_CLIENT_MAX; i++) {
 			if (BIT(i) & viol)
-				dev_err_ratelimited(ope->dev,
-					"Write Engine WE%d: image size violation\n", i);
+				dev_err_ratelimited(ope->dev, "WE%d: image size violation\n", i);
 		}
 		ope_write(ctx->ope, OPE_TOP_RESET_CMD, OPE_TOP_RESET_CMD_SW);
 	}
 
 	if (status & OPE_BUS_WR_INPUT_IF_IRQ_STATUS_0_VIOL) {
 		u32 viol = ope_read_wr(ope, OPE_BUS_WR_VIOLATION_STATUS);
-		dev_err_ratelimited(ope->dev,
-			"Write Engine: fatal violation (status=0x%08x)\n", viol);
+
+		dev_err_ratelimited(ope->dev, "fatal violation (status=0x%08x)\n", viol);
 		ope_write(ctx->ope, OPE_TOP_RESET_CMD, OPE_TOP_RESET_CMD_SW);
 	}
 
@@ -1435,7 +1412,7 @@ static int ope_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 
 	if (idx == OPE_QUEUE_FRAME_IN)
 		size = ctx->fmt_in.sizeimage ? ctx->fmt_in.sizeimage : PAGE_SIZE;
-	else if (idx == OPE_QUEUE_FRAME_OUT)
+	else if (idx == OPE_QUEUE_DISP_OUT)
 		size = ctx->fmt_out.sizeimage ? ctx->fmt_out.sizeimage : PAGE_SIZE;
 	else
 		size = v4l2_isp_params_buffer_size(CAMSS_PARAMS_MAX_PAYLOAD);
@@ -1447,6 +1424,7 @@ static int ope_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 		*nplanes = 1;
 		sizes[0] = size;
 	}
+
 	return 0;
 }
 
@@ -1459,7 +1437,7 @@ static int ope_buf_prepare(struct vb2_buffer *vb)
 
 	if (idx == OPE_QUEUE_FRAME_IN)
 		sizeimage = ctx->fmt_in.sizeimage;
-	else if (idx == OPE_QUEUE_FRAME_OUT)
+	else if (idx == OPE_QUEUE_DISP_OUT)
 		sizeimage = ctx->fmt_out.sizeimage;
 	else
 		sizeimage = v4l2_isp_params_buffer_size(CAMSS_PARAMS_MAX_PAYLOAD);
@@ -1479,7 +1457,6 @@ static int ope_buf_prepare(struct vb2_buffer *vb)
 	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
 		vb2_set_plane_payload(vb, 0, sizeimage);
 
-
 	return 0;
 }
 
@@ -1493,7 +1470,7 @@ static void ope_buf_queue(struct vb2_buffer *vb)
 	ope_try_schedule(ctx);
 }
 
-/* ---- Power scaling ---------------------------------------------------- */
+/* -------- Power scaling -------- */
 
 static inline unsigned long ope_pixclk(const struct ope_fmt_state *fs,
 					unsigned int fps)
@@ -1645,7 +1622,7 @@ static int ope_init_vq(struct ope_ctx *ctx, unsigned int idx)
 		q->type    = V4L2_BUF_TYPE_META_OUTPUT;
 		q->mem_ops = &vb2_vmalloc_memops;
 		q->io_modes = VB2_MMAP | VB2_USERPTR;
-	} else if (idx == OPE_QUEUE_FRAME_OUT) {
+	} else if (idx == OPE_QUEUE_DISP_OUT) {
 		q->type    = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 		q->mem_ops = &vb2_dma_contig_memops;
 		q->io_modes = VB2_MMAP | VB2_DMABUF;
@@ -1668,6 +1645,7 @@ static const struct ope_fmt *ope_find_fmt(const struct ope_fmt *fmts,
 	for (i = 0; i < n; i++)
 		if (fmts[i].fourcc == fourcc)
 			return &fmts[i];
+
 	return NULL;
 }
 
@@ -1677,8 +1655,8 @@ static const struct ope_fmt *ope_fmt_try(struct ope_dev *ope, bool is_output,
 {
 	const struct ope_fmt *fmts = is_output ? ope_output_fmts : ope_input_fmts;
 	unsigned int n = is_output ? ARRAY_SIZE(ope_output_fmts) : ARRAY_SIZE(ope_input_fmts);
-	const struct ope_fmt *fmt;
 	unsigned int max_w = OPE_MAX_W, max_h = OPE_MAX_H;
+	const struct ope_fmt *fmt;
 	unsigned int bytesperline;
 
 	fmt = ope_find_fmt(fmts, n, pix->pixelformat);
@@ -1700,7 +1678,6 @@ static const struct ope_fmt *ope_fmt_try(struct ope_dev *ope, bool is_output,
 	if (!pix->colorspace)
 		pix->colorspace = is_output ? V4L2_COLORSPACE_SRGB
 					    : V4L2_COLORSPACE_RAW;
-
 	/*
 	 * Output formats are semi-planar or grey-scale (Y plane only) always
 	 * using 1 byte per Y value. pix->bytesperline stores the Y-plane bpl.
@@ -1817,17 +1794,30 @@ static int ope_s_fmt_vid_out(struct file *file, void *priv, struct v4l2_format *
 	ctx->fmt_in.ycbcr_enc	    = f->fmt.pix_mp.ycbcr_enc;
 	ctx->fmt_in.quantization    = f->fmt.pix_mp.quantization;
 
+	/* Reset crop to full input frame */
+	ctx->fmt_in.crop.left   = 0;
+	ctx->fmt_in.crop.top    = 0;
+	ctx->fmt_in.crop.width  = ctx->fmt_in.width;
+	ctx->fmt_in.crop.height = ctx->fmt_in.height;
+
 	return 0;
 }
 
 static int ope_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index >= ARRAY_SIZE(ope_output_fmts))
-		return -EINVAL;
+	struct ope_ctx *ctx = ope_ctx_from_file(file);
+	unsigned int n = 0;
 
-	f->pixelformat = ope_output_fmts[f->index].fourcc;
+	for (unsigned int i = 0; i < ARRAY_SIZE(ope_output_fmts); i++) {
+		if (ope_output_fmts[i].mbus_code != ctx->proc_mbus_code)
+			continue;
+		if (n++ == f->index) {
+			f->pixelformat = ope_output_fmts[i].fourcc;
+			return 0;
+		}
+	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static int ope_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
@@ -1865,10 +1855,11 @@ static int ope_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	struct ope_ctx *ctx = ope_ctx_from_file(file);
 	const struct ope_fmt *fmt;
 
-	if (vb2_is_busy(&ctx->vqs[OPE_QUEUE_FRAME_OUT]))
+	if (vb2_is_busy(&ctx->vqs[OPE_QUEUE_DISP_OUT]))
 		return -EBUSY;
 
 	fmt = ope_fmt_try(ctx->ope, true, &f->fmt.pix_mp, &ctx->fmt_in);
+
 	ctx->fmt_out.fmt	    = fmt;
 	ctx->fmt_out.width	    = f->fmt.pix_mp.width;
 	ctx->fmt_out.height	    = f->fmt.pix_mp.height;
@@ -1878,6 +1869,64 @@ static int ope_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	ctx->fmt_out.xfer_func	    = f->fmt.pix_mp.xfer_func;
 	ctx->fmt_out.ycbcr_enc	    = f->fmt.pix_mp.ycbcr_enc;
 	ctx->fmt_out.quantization   = f->fmt.pix_mp.quantization;
+	/* Sync proc mbus code with selected pixel format */
+	ctx->proc_mbus_code = fmt->mbus_code;
+	/* Reset disp compose to full output frame */
+	ctx->disp_compose.left   = 0;
+	ctx->disp_compose.top    = 0;
+	ctx->disp_compose.width  = ctx->fmt_out.width;
+	ctx->disp_compose.height = ctx->fmt_out.height;
+
+	return 0;
+}
+
+/* Input crop */
+static int ope_g_selection(struct file *file, void *priv,
+			   struct v4l2_selection *s)
+{
+	struct ope_ctx *ctx = ope_ctx_from_file(file);
+
+	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+	    s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		return -EINVAL;
+
+	switch (s->target) {
+	case V4L2_SEL_TGT_CROP:
+		s->r = ctx->fmt_in.crop;
+		return 0;
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		s->r.left = s->r.top = 0;
+		s->r.width  = ctx->fmt_in.width;
+		s->r.height = ctx->fmt_in.height;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int ope_s_selection(struct file *file, void *priv,
+			   struct v4l2_selection *s)
+{
+	struct ope_ctx *ctx = ope_ctx_from_file(file);
+
+	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+	    s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		return -EINVAL;
+	if (s->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+	if (vb2_is_busy(&ctx->vqs[OPE_QUEUE_FRAME_IN]))
+		return -EBUSY;
+
+	s->r.left   = clamp_t(int, s->r.left, 0,
+			      (int)ctx->fmt_in.width - OPE_MIN_W);
+	s->r.top    = clamp_t(int, s->r.top,  0,
+			      (int)ctx->fmt_in.height - OPE_MIN_H);
+	s->r.width  = clamp(s->r.width,  (unsigned int)OPE_MIN_W,
+			    ctx->fmt_in.width  - (unsigned int)s->r.left);
+	s->r.height = clamp(s->r.height, (unsigned int)OPE_MIN_H,
+			    ctx->fmt_in.height - (unsigned int)s->r.top);
+	ctx->fmt_in.crop = s->r;
 
 	return 0;
 }
@@ -2003,6 +2052,7 @@ static int ope_qbuf(struct file *file, void *priv, struct v4l2_buffer *buf)
 		return -EINVAL;
 	if (vb2_queue_is_busy(vq, file))
 		return -EBUSY;
+
 	return vb2_qbuf(vq, vdev->v4l2_dev->mdev, buf);
 }
 
@@ -2024,6 +2074,7 @@ static int ope_prepare_buf(struct file *file, void *priv, struct v4l2_buffer *bu
 		return -EINVAL;
 	if (vb2_queue_is_busy(vq, file))
 		return -EBUSY;
+
 	return vb2_prepare_buf(vq, vdev->v4l2_dev->mdev, buf);
 }
 
@@ -2040,6 +2091,7 @@ static int ope_create_bufs(struct file *file, void *priv, struct v4l2_create_buf
 	ret = vb2_create_bufs(vq, create);
 	if (!ret && create->count)
 		vq->owner = file->private_data;
+
 	return ret;
 }
 
@@ -2052,6 +2104,7 @@ static int ope_expbuf(struct file *file, void *priv, struct v4l2_exportbuffer *e
 		return -EINVAL;
 	if (vb2_queue_is_busy(vq, file))
 		return -EBUSY;
+
 	return vb2_expbuf(vq, eb);
 }
 
@@ -2064,6 +2117,7 @@ static int ope_streamon(struct file *file, void *priv, enum v4l2_buf_type type)
 		return -EINVAL;
 	if (vb2_queue_is_busy(vq, file))
 		return -EBUSY;
+
 	return vb2_streamon(vq, type);
 }
 
@@ -2083,6 +2137,396 @@ static int ope_streamoff(struct file *file, void *priv, enum v4l2_buf_type type)
 	return vb2_streamoff(vq, type);
 }
 
+/* -------- proc subdev ops -------- */
+
+enum ope_proc_pad {
+	OPE_PROC_PAD_SINK_IN,
+	OPE_PROC_PAD_SINK_PAR,
+	OPE_PROC_PAD_SOURCE,
+	OPE_PROC_PADS_NUM,
+};
+
+static int ope_proc_get_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *fmt)
+{
+	struct ope_ctx *ctx = container_of(sd->v4l2_dev,
+					   struct ope_dev, v4l2_dev)->shared_ctx;
+
+	if (fmt->pad == OPE_PROC_PAD_SOURCE) {
+		fmt->format.width  = ctx ? ctx->fmt_in.crop.width  : 640;
+		fmt->format.height = ctx ? ctx->fmt_in.crop.height : 480;
+		fmt->format.code   = ctx ? ctx->proc_mbus_code
+					 : MEDIA_BUS_FMT_YUYV8_1_5X8;
+		fmt->format.field  = V4L2_FIELD_NONE;
+		fmt->format.colorspace = V4L2_COLORSPACE_SRGB;
+	} else if (fmt->pad == OPE_PROC_PAD_SINK_IN) {
+		fmt->format.width  = ctx ? ctx->fmt_in.width  : 640;
+		fmt->format.height = ctx ? ctx->fmt_in.height : 480;
+		fmt->format.code   = ctx ? ctx->fmt_in.fmt->mbus_code
+					 : MEDIA_BUS_FMT_SRGGB8_1X8;
+		fmt->format.field  = V4L2_FIELD_NONE;
+		fmt->format.colorspace = V4L2_COLORSPACE_RAW;
+	} else { /* Params sink (pad1): no image format */
+		fmt->format.width  = 0;
+		fmt->format.height = 0;
+		fmt->format.code   = MEDIA_BUS_FMT_FIXED;
+		fmt->format.field  = V4L2_FIELD_NONE;
+		fmt->format.colorspace = V4L2_COLORSPACE_DEFAULT;
+	}
+
+	return 0;
+}
+
+static int ope_proc_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *fmt)
+{
+	struct ope_dev *ope = container_of(sd->v4l2_dev, struct ope_dev, v4l2_dev);
+	struct ope_ctx *ctx = ope->shared_ctx;
+
+	if (!ctx && fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -ENODEV;
+
+	if (fmt->pad != OPE_PROC_PAD_SOURCE)
+		return ope_proc_get_fmt(sd, state, fmt);
+
+	/* Validate mbus code: must match one of the output formats */
+	for (unsigned int i = 0; i < ARRAY_SIZE(ope_output_fmts); i++)
+		if (ope_output_fmts[i].mbus_code == fmt->format.code)
+			goto valid;
+
+	fmt->format.code = MEDIA_BUS_FMT_YUYV8_1_5X8;
+
+valid:
+	fmt->format.width  = ctx->fmt_in.crop.width;
+	fmt->format.height = ctx->fmt_in.crop.height;
+	fmt->format.field  = V4L2_FIELD_NONE;
+	fmt->format.colorspace = V4L2_COLORSPACE_SRGB;
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		ctx->proc_mbus_code = fmt->format.code;
+
+	return 0;
+}
+
+static int ope_proc_enum_mbus_code(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state,
+				   struct v4l2_subdev_mbus_code_enum *code)
+{
+	unsigned int n = 0;
+
+	if (code->pad != OPE_PROC_PAD_SOURCE)
+		return -EINVAL;
+
+	/* Enumerate unique mbus codes from output format table */
+	for (unsigned int i = 0; i < ARRAY_SIZE(ope_output_fmts); i++) {
+		u32 mc = ope_output_fmts[i].mbus_code;
+		bool seen = false;
+
+		for (unsigned int j = 0; j < i; j++) {
+			if (ope_output_fmts[j].mbus_code == mc) {
+				seen = true;
+				break;
+			}
+		}
+
+		if (seen)
+			continue;
+
+		if (n++ == code->index) {
+			code->code = mc;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int ope_proc_init_state(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_state *state)
+{
+	unsigned int pad;
+
+	for (pad = 0; pad < OPE_PROC_PADS_NUM; pad++) {
+		struct v4l2_subdev_format fmt = {
+			.which = V4L2_SUBDEV_FORMAT_TRY,
+			.pad = pad
+		};
+		int ret;
+
+		ret = ope_proc_get_fmt(sd, state, &fmt);
+		if (ret)
+			return ret;
+
+		*v4l2_subdev_state_get_format(state, pad) = fmt.format;
+	}
+
+	return 0;
+}
+
+static int ope_proc_get_selection(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
+{
+	struct ope_ctx *ctx = container_of(sd->v4l2_dev,
+					   struct ope_dev, v4l2_dev)->shared_ctx;
+
+	if (sel->pad != OPE_PROC_PAD_SINK_IN)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		sel->r = ctx ? ctx->fmt_in.crop : (struct v4l2_rect){ 0, 0, 640, 480 };
+		return 0;
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = sel->r.top = 0;
+		sel->r.width = ctx ? ctx->fmt_in.width  : 640;
+		sel->r.height = ctx ? ctx->fmt_in.height : 480;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int ope_proc_set_selection(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
+{
+	struct ope_dev *ope = container_of(sd->v4l2_dev, struct ope_dev, v4l2_dev);
+	struct ope_ctx *ctx = ope->shared_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+	if (sel->pad != OPE_PROC_PAD_SINK_IN || sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	sel->r.left = clamp_t(int, sel->r.left, 0, (int)ctx->fmt_in.width - OPE_MIN_W);
+	sel->r.top = clamp_t(int, sel->r.top,  0, (int)ctx->fmt_in.height - OPE_MIN_H);
+	sel->r.width = clamp(sel->r.width,  (unsigned int)OPE_MIN_W,
+			      ctx->fmt_in.width  - (unsigned int)sel->r.left);
+	sel->r.height = clamp(sel->r.height, (unsigned int)OPE_MIN_H,
+			      ctx->fmt_in.height - (unsigned int)sel->r.top);
+
+	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		ctx->fmt_in.crop = sel->r;
+
+	return 0;
+}
+
+static const struct v4l2_subdev_pad_ops ope_proc_pad_ops = {
+	.get_fmt	= ope_proc_get_fmt,
+	.set_fmt	= ope_proc_set_fmt,
+	.enum_mbus_code	= ope_proc_enum_mbus_code,
+	.get_selection	= ope_proc_get_selection,
+	.set_selection	= ope_proc_set_selection,
+};
+
+static const struct v4l2_subdev_internal_ops ope_proc_internal_ops = {
+	.init_state = ope_proc_init_state,
+};
+
+static const struct v4l2_subdev_ops ope_proc_ops = {
+	.pad = &ope_proc_pad_ops,
+};
+
+/* -------- disp subdev ops -------- */
+
+enum ope_disp_pad {
+	OPE_DISP_PAD_SINK,
+	OPE_DISP_PAD_SOURCE,
+	OPE_DISP_PADS_NUM,
+};
+
+static int ope_disp_get_fmt(struct v4l2_subdev *sd,
+			    struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *fmt)
+{
+	struct ope_ctx *ctx = container_of(sd->v4l2_dev,
+					   struct ope_dev, v4l2_dev)->shared_ctx;
+	u32 mbus = ctx ? ctx->proc_mbus_code : MEDIA_BUS_FMT_YUYV8_1_5X8;
+
+	if (fmt->pad == OPE_DISP_PAD_SINK) {
+		fmt->format.width = ctx ? ctx->fmt_in.crop.width  : 640;
+		fmt->format.height = ctx ? ctx->fmt_in.crop.height : 480;
+		fmt->format.code = mbus;
+		fmt->format.field = V4L2_FIELD_NONE;
+		fmt->format.colorspace = V4L2_COLORSPACE_SRGB;
+	} else {
+		fmt->format.width = ctx ? ctx->disp_compose.width  : 640;
+		fmt->format.height = ctx ? ctx->disp_compose.height : 480;
+		fmt->format.code = mbus;
+		fmt->format.field = V4L2_FIELD_NONE;
+		fmt->format.colorspace = ctx ? ctx->fmt_out.colorspace : V4L2_COLORSPACE_SRGB;
+	}
+
+	return 0;
+}
+
+static int ope_disp_set_fmt(struct v4l2_subdev *sd,
+			    struct v4l2_subdev_state *state,
+			    struct v4l2_subdev_format *fmt)
+{
+	struct ope_dev *ope = container_of(sd->v4l2_dev, struct ope_dev, v4l2_dev);
+	struct ope_ctx *ctx = ope->shared_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+
+	if (fmt->pad == OPE_DISP_PAD_SINK) {
+		/* Sink format is read-only (driven by crop on frame-input) */
+		return ope_disp_get_fmt(sd, state, fmt);
+	}
+
+	/* Source pad: set output (compose) dimensions */
+	fmt->format.width = clamp(fmt->format.width, (unsigned int)OPE_MIN_W,
+				  ctx->fmt_in.crop.width);
+	fmt->format.height = clamp(fmt->format.height, (unsigned int)OPE_MIN_H,
+				   ctx->fmt_in.crop.height);
+	fmt->format.code = ctx->proc_mbus_code;
+	fmt->format.field = V4L2_FIELD_NONE;
+
+	if (fmt->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return 0;
+
+	ctx->disp_compose.width  = fmt->format.width;
+	ctx->disp_compose.height = fmt->format.height;
+	/* Keep compose origin, clip if needed */
+	ctx->disp_compose.left = clamp_t(int, ctx->disp_compose.left, 0,
+					 (int)ctx->fmt_out.width - (int)ctx->disp_compose.width);
+	ctx->disp_compose.top  = clamp_t(int, ctx->disp_compose.top, 0,
+					 (int)ctx->fmt_out.height - (int)ctx->disp_compose.height);
+
+	return 0;
+}
+
+static int ope_disp_get_selection(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
+{
+	struct ope_ctx *ctx = container_of(sd->v4l2_dev,
+					   struct ope_dev, v4l2_dev)->shared_ctx;
+
+	if (!ctx) {
+		sel->r = (struct v4l2_rect){ 0, 0, 640, 480 };
+		return sel->pad == OPE_DISP_PAD_SOURCE ? 0 : -EINVAL;
+	}
+
+	if (sel->pad == OPE_DISP_PAD_SOURCE) {
+		switch (sel->target) {
+		case V4L2_SEL_TGT_COMPOSE:
+			sel->r = ctx->disp_compose;
+			return 0;
+		case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+			sel->r.left = sel->r.top = 0;
+			sel->r.width  = ctx->fmt_out.width;
+			sel->r.height = ctx->fmt_out.height;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int ope_disp_set_selection(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
+{
+	struct ope_dev *ope = container_of(sd->v4l2_dev, struct ope_dev, v4l2_dev);
+	struct ope_ctx *ctx = ope->shared_ctx;
+
+	if (!ctx)
+		return -ENODEV;
+
+	if (sel->pad != OPE_DISP_PAD_SOURCE ||
+	    sel->target != V4L2_SEL_TGT_COMPOSE)
+		return -EINVAL;
+
+	/* Clamp compose rect to output buffer bounds */
+	sel->r.left = clamp_t(int, sel->r.left, 0, (int)ctx->fmt_out.width  - OPE_MIN_W);
+	sel->r.top = clamp_t(int, sel->r.top,  0, (int)ctx->fmt_out.height - OPE_MIN_H);
+	sel->r.width = clamp(sel->r.width,  (unsigned int)OPE_MIN_W,
+			     ctx->fmt_out.width  - (unsigned int)sel->r.left);
+	sel->r.height = clamp(sel->r.height, (unsigned int)OPE_MIN_H,
+			      ctx->fmt_out.height - (unsigned int)sel->r.top);
+
+	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		ctx->disp_compose = sel->r;
+
+	return 0;
+}
+
+
+static int ope_disp_init_state(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_state *state)
+{
+	unsigned int pad;
+
+	for (pad = 0; pad < OPE_DISP_PADS_NUM; pad++) {
+		struct v4l2_subdev_format fmt = {
+			.which = V4L2_SUBDEV_FORMAT_TRY,
+			fmt.pad = pad
+		};
+		int ret;
+
+		ret = ope_disp_get_fmt(sd, state, &fmt);
+		if (ret)
+			return ret;
+
+		*v4l2_subdev_state_get_format(state, pad) = fmt.format;
+	}
+
+	return 0;
+}
+
+static const struct v4l2_subdev_pad_ops ope_disp_pad_ops = {
+	.get_fmt	= ope_disp_get_fmt,
+	.set_fmt	= ope_disp_set_fmt,
+	.get_selection	= ope_disp_get_selection,
+	.set_selection	= ope_disp_set_selection,
+};
+
+static const struct v4l2_subdev_internal_ops ope_disp_internal_ops = {
+	.init_state = ope_disp_init_state,
+};
+
+static const struct v4l2_subdev_ops ope_disp_ops = {
+	.pad = &ope_disp_pad_ops,
+};
+
+/* -------- disp-output video ops -------- */
+
+static int ope_disp_output_link_validate(struct media_link *link)
+{
+	struct video_device *vdev = media_entity_to_video_device(link->sink->entity);
+	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(link->source->entity);
+	struct ope_ctx *ctx = video_get_drvdata(vdev);
+	struct v4l2_subdev_format sd_fmt = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+		.pad   = link->source->index,
+	};
+	int ret;
+
+	if (!ctx)
+		return 0;
+
+	ret = v4l2_subdev_call(sd, pad, get_fmt, NULL, &sd_fmt);
+	if (ret)
+		return ret;
+
+	if (ctx->fmt_out.fmt->mbus_code != sd_fmt.format.code) {
+		dev_dbg(ctx->ope->dev, "link validate: mbus 0x%04x incompatible with %.4s\n",
+			sd_fmt.format.code, (char *)&ctx->fmt_out.fmt->fourcc);
+		return -EPIPE;
+	}
+
+	return 0;
+}
+
+static const struct media_entity_operations ope_disp_output_entity_ops = {
+	.link_validate = ope_disp_output_link_validate,
+};
+
 static const struct v4l2_ioctl_ops ope_video_ioctl_ops = {
 	.vidioc_querycap		= ope_querycap,
 	.vidioc_enum_fmt_vid_out	= ope_enum_fmt_vid_out,
@@ -2093,6 +2537,8 @@ static const struct v4l2_ioctl_ops ope_video_ioctl_ops = {
 	.vidioc_g_fmt_vid_cap_mplane	= ope_g_fmt_vid_cap,
 	.vidioc_try_fmt_vid_cap_mplane	= ope_try_fmt_vid_cap,
 	.vidioc_s_fmt_vid_cap_mplane	= ope_s_fmt_vid_cap,
+	.vidioc_g_selection		= ope_g_selection,
+	.vidioc_s_selection		= ope_s_selection,
 	.vidioc_enum_framesizes		= ope_enum_framesizes,
 	.vidioc_g_parm			= ope_g_parm,
 	.vidioc_s_parm			= ope_s_parm,
@@ -2159,6 +2605,7 @@ static struct ope_ctx *ope_ctx_create(struct ope_dev *ope)
 	ctx->fmt_in.bytesperline = OPE_MIN_W * ope_input_fmts[0].depth / 8;
 	ctx->fmt_in.sizeimage	 = ctx->fmt_in.bytesperline * OPE_MIN_H;
 	ctx->fmt_in.colorspace	 = V4L2_COLORSPACE_RAW;
+	ctx->fmt_in.crop	 = (struct v4l2_rect){ 0, 0, OPE_MIN_W, OPE_MIN_H };
 	ctx->fmt_in.timeperframe.numerator   = 1;
 	ctx->fmt_in.timeperframe.denominator = DEFAULT_FRAMERATE;
 
@@ -2170,6 +2617,8 @@ static struct ope_ctx *ope_ctx_create(struct ope_dev *ope)
 	ctx->fmt_out.sizeimage	  = (u64)ope_output_fmts[0].depth *
 				    OPE_MIN_W * OPE_MIN_H / 8;
 	ctx->fmt_out.colorspace	  = V4L2_COLORSPACE_SRGB;
+	ctx->disp_compose	  = (struct v4l2_rect){ 0, 0, OPE_MIN_W, OPE_MIN_H };
+	ctx->proc_mbus_code	  = MEDIA_BUS_FMT_YUYV8_1_5X8; /* default YUV420 */
 
 	for (i = 0; i < OPE_QUEUE_COUNT; i++) {
 		ret = ope_init_vq(ctx, i);
@@ -2322,8 +2771,8 @@ static const struct v4l2_file_operations ope_fops = {
 
 /* Pipeline descriptor  */
 static const struct camss_isp_entity_desc ope_entity_descs[] = {
-	[OPE_QUEUE_FRAME_IN] = {
-		.name      = "frame-input",
+	[OPE_ENTITY_FRAME_IN] = {
+		.name      = "ope_input",
 		.obj_type  = MEDIA_ENTITY_TYPE_VIDEO_DEVICE,
 		.function  = MEDIA_ENT_F_IO_V4L,
 		.vdev.caps = V4L2_CAP_VIDEO_OUTPUT_MPLANE | V4L2_CAP_STREAMING,
@@ -2331,25 +2780,26 @@ static const struct camss_isp_entity_desc ope_entity_descs[] = {
 		.vdev.fops = &ope_fops,
 		.vdev.ioctl_ops = &ope_video_ioctl_ops,
 		.pads = (const struct camss_isp_pad_desc[]) {
-			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_PROC, 0, 0 },
+			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_PROC, OPE_PROC_PAD_SINK_IN, 0 },
 			{ }
 		},
 	},
-	[OPE_QUEUE_FRAME_OUT] = {
-		.name      = "frame-output",
+	[OPE_ENTITY_DISP_OUT] = {
+		.name      = "ope_disp_output",
 		.obj_type  = MEDIA_ENTITY_TYPE_VIDEO_DEVICE,
 		.function  = MEDIA_ENT_F_IO_V4L,
 		.vdev.caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE | V4L2_CAP_STREAMING,
-		.vdev.drvdata = (void *)(uintptr_t)OPE_QUEUE_FRAME_OUT,
+		.vdev.drvdata = (void *)(uintptr_t)OPE_QUEUE_DISP_OUT,
 		.vdev.fops = &ope_fops,
 		.vdev.ioctl_ops = &ope_video_ioctl_ops,
+		.vdev.entity_ops = &ope_disp_output_entity_ops,
 		.pads = (const struct camss_isp_pad_desc[]) {
-			{ MEDIA_PAD_FL_SINK, OPE_ENTITY_PROC, 2, 0 },
+			{ MEDIA_PAD_FL_SINK, OPE_ENTITY_DISP, OPE_DISP_PAD_SOURCE, 0 },
 			{ }
 		},
 	},
-	[OPE_QUEUE_PARAMS] = {
-		.name      = "params",
+	[OPE_ENTITY_PARAMS] = {
+		.name      = "ope_params",
 		.obj_type  = MEDIA_ENTITY_TYPE_VIDEO_DEVICE,
 		.function  = MEDIA_ENT_F_IO_V4L,
 		.vdev.caps = V4L2_CAP_META_OUTPUT | V4L2_CAP_STREAMING,
@@ -2357,18 +2807,32 @@ static const struct camss_isp_entity_desc ope_entity_descs[] = {
 		.vdev.fops = &ope_fops,
 		.vdev.ioctl_ops = &ope_meta_ioctl_ops,
 		.pads = (const struct camss_isp_pad_desc[]) {
-			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_PROC, 1, 0 },
+			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_PROC, OPE_PROC_PAD_SINK_PAR, 0 },
 			{ }
 		},
 	},
 	[OPE_ENTITY_PROC] = {
-		.name     = "proc",
-		.obj_type = MEDIA_ENTITY_TYPE_BASE,
-		.function = MEDIA_ENT_F_PROC_VIDEO_ISP,
+		.name       = "ope_proc",
+		.obj_type   = MEDIA_ENTITY_TYPE_V4L2_SUBDEV,
+		.function   = MEDIA_ENT_F_PROC_VIDEO_ISP,
+		.subdev.ops = &ope_proc_ops,
+		.subdev.internal_ops = &ope_proc_internal_ops,
 		.pads = (const struct camss_isp_pad_desc[]) {
-			{ MEDIA_PAD_FL_SINK,   OPE_QUEUE_FRAME_IN,  0, 0 },
-			{ MEDIA_PAD_FL_SINK,   OPE_QUEUE_PARAMS,    0, 0 },
-			{ MEDIA_PAD_FL_SOURCE, OPE_QUEUE_FRAME_OUT, 0, 0 },
+			{ MEDIA_PAD_FL_SINK,   OPE_ENTITY_FRAME_IN, 0,                  0 },
+			{ MEDIA_PAD_FL_SINK,   OPE_ENTITY_PARAMS,   0,                  0 },
+			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_DISP,     OPE_DISP_PAD_SINK,  0 },
+			{ }
+		},
+	},
+	[OPE_ENTITY_DISP] = {
+		.name     = "ope_disp",
+		.obj_type = MEDIA_ENTITY_TYPE_V4L2_SUBDEV,
+		.function = MEDIA_ENT_F_PROC_VIDEO_SCALER,
+		.subdev.ops = &ope_disp_ops,
+		.subdev.internal_ops = &ope_disp_internal_ops,
+		.pads = (const struct camss_isp_pad_desc[]) {
+			{ MEDIA_PAD_FL_SINK,   OPE_ENTITY_PROC,     OPE_PROC_PAD_SOURCE, 0 },
+			{ MEDIA_PAD_FL_SOURCE, OPE_ENTITY_DISP_OUT, 0,                   0 },
 			{ }
 		},
 	},
@@ -2395,7 +2859,7 @@ static int ope_v4l2_init(struct ope_dev *ope)
 	if (ret)
 		goto err_v4l2;
 
-	ope->pipeline = camss_isp_pipeline_alloc(ARRAY_SIZE(ope_entity_descs));
+	ope->pipeline = camss_isp_pipeline_alloc(OPE_ENTITY_COUNT);
 	if (IS_ERR(ope->pipeline)) {
 		ret = PTR_ERR(ope->pipeline);
 		goto err_media;
@@ -2602,3 +3066,4 @@ module_platform_driver(ope_driver);
 MODULE_DESCRIPTION("CAMSS Offline Processing Engine");
 MODULE_AUTHOR("Loic Poulain <loic.poulain@oss.qualcomm.com>");
 MODULE_LICENSE("GPL");
+/* Downscaler fixed-point helpers */
