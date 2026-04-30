@@ -205,6 +205,18 @@ struct ope_fmt_state {
 #define OPE_PP_CLC_DOWNSCALE_MN_DS_C_PRE_BASE			0x1c00
 #define OPE_PP_CLC_DOWNSCALE_MN_DS_Y_DISP_BASE			0x3000
 #define OPE_PP_CLC_DOWNSCALE_MN_DS_C_DISP_BASE			0x3200
+#define OPE_PP_CLC_CROP_RND_CLAMP_Y_DISP_BASE			0x3400
+#define OPE_PP_CLC_CROP_RND_CLAMP_C_DISP_BASE			0x3600
+#define OPE_PP_CLC_CROP_RND_CLAMP_HW_STATUS(base)		((base) + 0x04)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_HEIGHT_VIOL	BIT(2)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_WIDTH_VIOL	BIT(1)
+#define OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(base)		((base) + 0x60)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_EN		BIT(0)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_CROP_EN	BIT(9)
+#define OPE_PP_CLC_CROP_RND_CLAMP_CROP_LINE_CFG(base)		((base) + 0x68)
+#define OPE_PP_CLC_CROP_RND_CLAMP_CROP_PIXEL_CFG(base)		((base) + 0x6c)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_CROP_FIRST	GENMASK(29, 16)
+#define		OPE_PP_CLC_CROP_RND_CLAMP_CROP_LAST	GENMASK(13, 0)
 #define OPE_PP_CLC_DOWNSCALE_MN_CFG(ds)			((ds) + 0x60)
 #define		OPE_PP_CLC_DOWNSCALE_MN_CFG_EN		BIT(0)
 #define OPE_PP_CLC_DOWNSCALE_MN_DS_CFG(ds)			((ds) + 0x64)
@@ -265,6 +277,14 @@ struct ope_fmt_state {
 	 ((out) * 8   <= (in)) ? 0x2 : 0x3)
 #define DS_OUTPUT_PIX(in, phase_init, phase_step) \
 	((Q21(in) - (phase_init)) / (phase_step))
+/*
+ * DS_SCALER_COUNT: actual pixel count produced by the MN scaler for @in
+ * input pixels with the given @phase_step (phase_init assumed 0).
+ * Empirically the chroma scaler delivers ceil(Q21(in) / phase_step) pixels.
+ * This equals (Q21(in) + phase_step - 1) / phase_step.
+ */
+#define DS_SCALER_COUNT(in, phase_step) \
+	((Q21(in) + (phase_step) - 1) / (phase_step))
 
 #define OPE_WB(n, d)		(((n) << 10) / (d))
 
@@ -397,6 +417,8 @@ struct ope_dsc_config {
 	u32 input_width, input_height;
 	u32 output_width, output_height;
 	u32 phase_step_h, phase_step_v;
+	u32 crop_last_pixel;
+	u32 crop_last_line;
 };
 
 struct ope_stripe {
@@ -618,10 +640,12 @@ static void ope_gen_stripe_chroma_dsc(struct ope_ctx *ctx,
 }
 
 static void ope_gen_stripe_dsc(struct ope_ctx *ctx, struct ope_stripe *stripe,
-				u32 h_scale, u32 v_scale)
+			u32 h_scale, u32 v_scale)
 {
 	struct ope_dsc_config *dsc_c = &stripe->dsc[OPE_DS_C_DISP];
 	struct ope_dsc_config *dsc_y = &stripe->dsc[OPE_DS_Y_DISP];
+	unsigned int sw   = stripe->src.width;
+	unsigned int sw_c = stripe->dsc[OPE_DS_C_PRE].output_width;
 
 	dsc_c->phase_step_h = dsc_y->phase_step_h = h_scale;
 	dsc_c->phase_step_v = dsc_y->phase_step_v = v_scale;
@@ -631,10 +655,21 @@ static void ope_gen_stripe_dsc(struct ope_ctx *ctx, struct ope_stripe *stripe,
 	dsc_y->input_width  = stripe->src.width;
 	dsc_y->input_height = stripe->src.height;
 
-	dsc_c->output_width  = DS_OUTPUT_PIX(dsc_c->input_width,  0, h_scale);
-	dsc_c->output_height = DS_OUTPUT_PIX(dsc_c->input_height, 0, v_scale);
-	dsc_y->output_width  = DS_OUTPUT_PIX(dsc_y->input_width,  0, h_scale);
-	dsc_y->output_height = DS_OUTPUT_PIX(dsc_y->input_height, 0, v_scale);
+	/*
+	 * WE width/height = DS_OUTPUT_PIX (floor).  The scaler may deliver
+	 * floor or floor+1 pixels/lines; CROP_RND_CLAMP clips the output to
+	 * exactly floor so the WE always receives the expected count.
+	 */
+	dsc_y->output_width  = DS_OUTPUT_PIX(sw, 0, h_scale);
+	dsc_y->output_height = DS_OUTPUT_PIX(stripe->src.height, 0, v_scale);
+	dsc_c->output_width  = DS_OUTPUT_PIX(sw_c, 0, h_scale);
+	dsc_c->output_height = DS_OUTPUT_PIX(stripe->dsc[OPE_DS_C_PRE].output_height,
+					    0, v_scale);
+
+	dsc_y->crop_last_pixel = dsc_y->output_width  - 1;
+	dsc_y->crop_last_line  = dsc_y->output_height - 1;
+	dsc_c->crop_last_pixel = dsc_c->output_width  - 1;
+	dsc_c->crop_last_line  = dsc_c->output_height - 1;
 }
 
 static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
@@ -670,6 +705,11 @@ static void ope_gen_stripe_yuv_dst(struct ope_ctx *ctx,
 
 	stripe->dst[OPE_WR_CLIENT_DISP_C].addr   = dst + img_w * img_h;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].x_init = x_init;
+	pr_debug("WE3_C: x_init=%u width=%u stride=%u sum=%u\n",
+		 x_init,
+		 stripe->dsc[OPE_DS_C_DISP].output_width * 2,
+		 img_w,
+		 x_init + stripe->dsc[OPE_DS_C_DISP].output_width * 2);
 	stripe->dst[OPE_WR_CLIENT_DISP_C].format = hw ? hw->packer : OPE_PACKER_FMT_PLAIN_8;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].width  = stripe->dsc[OPE_DS_C_DISP].output_width * 2;
 	stripe->dst[OPE_WR_CLIENT_DISP_C].height = stripe->dsc[OPE_DS_C_DISP].output_height;
@@ -715,7 +755,7 @@ static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 	const struct ope_fmt_state *fi = &ctx->fmt_in;
 	const struct ope_fmt_state *fo = &ctx->fmt_out;
 	const struct ope_hw_fmt *src_hw = ope_find_hw_fmt(fi->fmt->fourcc);
-	unsigned int num_stripes, width, i;
+	unsigned int num_stripes, width, x_out, x_out_c, i;
 	u32 h_scale, v_scale;
 
 	width      = fi->width;
@@ -723,8 +763,11 @@ static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 	h_scale    = DS_Q21(fi->width,  fo->width);
 	v_scale    = DS_Q21(fi->height, fo->height);
 
+	x_out = x_out_c = 0;
+
 	for (i = 0; i < num_stripes; i++) {
 		struct ope_stripe *stripe = &ctx->stripe[i];
+		unsigned int sw;
 
 		memset(stripe, 0, sizeof(*stripe));
 
@@ -748,16 +791,43 @@ static void ope_gen_stripes(struct ope_ctx *ctx, dma_addr_t src, dma_addr_t dst)
 				      OPE_STRIPE_MIN_H, OPE_STRIPE_MAX_H,
 				      OPE_ALIGN_H, 0);
 
+		sw   = stripe->src.width;
+
 		width -= stripe->src.width;
 		src   += stripe->src.width * fi->fmt->depth / 8;
 
 		if (ope_pix_fmt_is_yuv(fo->fmt->fourcc)) {
+			/*
+			 * Last-stripe adjustment: grow the input width (up to the
+			 * available remaining input) until the scaler delivers at
+			 * least the remaining output pixels for both Y and C.
+			 * CROP_RND_CLAMP then clips the scaler output to exactly
+			 * the remaining pixels so the total sums to fo->width.
+			 */
+			if (ope_stripe_is_last(stripe)) {
+				unsigned int rem_y = fo->width       - x_out;
+				unsigned int rem_c = fo->width / 2   - x_out_c;
+				unsigned int s;
+
+				for (s = OPE_STRIPE_MIN_W; s <= sw; s += 2) {
+					if (DS_OUTPUT_PIX(s,     0, h_scale) >= rem_y &&
+					    DS_OUTPUT_PIX(s / 2, 0, h_scale) >= rem_c) {
+						stripe->src.width = s;
+						break;
+					}
+				}
+			}
+
+			/* C_PRE must be computed after the width adjustment. */
 			ope_gen_stripe_chroma_dsc(ctx, stripe);
 			ope_gen_stripe_dsc(ctx, stripe, h_scale, v_scale);
 			ope_gen_stripe_yuv_dst(ctx, stripe, dst);
+			x_out   += stripe->dsc[OPE_DS_Y_DISP].output_width;
+			x_out_c += stripe->dsc[OPE_DS_C_DISP].output_width;
 		} else {
 			ope_gen_stripe_argb_dst(ctx, stripe, dst);
 		}
+
 
 		/* Width in bytes for the fetch engine */
 		stripe->src.width = stripe->src.width * fi->fmt->depth / 8;
@@ -894,6 +964,45 @@ static void ope_prog_color_correct(struct ope_ctx *ctx, bool force)
 		     FIELD_PREP(OPE_PP_CLC_CC_COEFF_M_CFG_M, cc->m));
 }
 
+
+
+
+static void ope_prog_crop_rnd_clamp(struct ope_dev *ope,
+				    const struct ope_stripe *stripe)
+{
+	static const u32 crop_bases[] = {
+		OPE_PP_CLC_CROP_RND_CLAMP_Y_DISP_BASE,
+		OPE_PP_CLC_CROP_RND_CLAMP_C_DISP_BASE,
+	};
+	static const enum ope_downscaler ds_idx[] = {
+		OPE_DS_Y_DISP,
+		OPE_DS_C_DISP,
+	};
+	unsigned int j;
+
+	for (j = 0; j < ARRAY_SIZE(crop_bases); j++) {
+		const struct ope_dsc_config *dsc = &stripe->dsc[ds_idx[j]];
+		u32 cbase = crop_bases[j];
+		if (!dsc->output_width || !dsc->output_height) {
+			ope_write_pp(ope,
+				     OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(cbase), 0);
+			continue;
+		}
+
+		ope_write_pp(ope, OPE_PP_CLC_CROP_RND_CLAMP_CROP_PIXEL_CFG(cbase),
+			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_FIRST, 0) |
+			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_LAST,
+					dsc->crop_last_pixel));
+		ope_write_pp(ope, OPE_PP_CLC_CROP_RND_CLAMP_CROP_LINE_CFG(cbase),
+			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_FIRST, 0) |
+			     FIELD_PREP(OPE_PP_CLC_CROP_RND_CLAMP_CROP_LAST,
+					dsc->crop_last_line));
+		ope_write_pp(ope, OPE_PP_CLC_CROP_RND_CLAMP_MODULE_CFG(cbase),
+			     OPE_PP_CLC_CROP_RND_CLAMP_EN |
+			     OPE_PP_CLC_CROP_RND_CLAMP_CROP_EN);
+	}
+}
+
 static void ope_prog_stripe(struct ope_ctx *ctx, struct ope_stripe *stripe)
 {
 	struct ope_dev *ope = ctx->ope;
@@ -963,7 +1072,15 @@ static void ope_prog_stripe(struct ope_ctx *ctx, struct ope_stripe *stripe)
 			     dsc->phase_step_v);
 		ope_write_pp(ope, OPE_PP_CLC_DOWNSCALE_MN_CFG(base),
 			     cfg ? OPE_PP_CLC_DOWNSCALE_MN_CFG_EN : 0);
+
+		dev_dbg(ope->dev,
+			"DS[%d] cfg=0x%x in=%ux%u out=%ux%u\n",
+			i, cfg,
+			dsc->input_width, dsc->input_height,
+			dsc->output_width, dsc->output_height);
 	}
+
+	ope_prog_crop_rnd_clamp(ope, stripe);
 }
 
 static void ope_params_apply_wb(void *priv, const union camss_isp_params_block *block)
@@ -1206,7 +1323,9 @@ static void ope_we_irq(struct ope_dev *ope, struct ope_ctx *ctx)
 	}
 
 	if (status & OPE_BUS_WR_INPUT_IF_IRQ_STATUS_0_VIOL) {
-		dev_err_ratelimited(ope->dev, "Write Engine: fatal violation\n");
+		u32 viol = ope_read_wr(ope, OPE_BUS_WR_VIOLATION_STATUS);
+		dev_err_ratelimited(ope->dev,
+			"Write Engine: fatal violation (status=0x%08x)\n", viol);
 		ope_write(ctx->ope, OPE_TOP_RESET_CMD, OPE_TOP_RESET_CMD_SW);
 	}
 
