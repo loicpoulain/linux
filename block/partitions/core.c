@@ -12,6 +12,7 @@
 #include <linux/ctype.h>
 #include <linux/vmalloc.h>
 #include <linux/raid/detect.h>
+#include <linux/of.h>
 #include "check.h"
 
 static int (*const check_part[])(struct parsed_partitions *) = {
@@ -112,6 +113,11 @@ static struct parsed_partitions *allocate_partitions(struct gendisk *hd)
 
 static void free_partitions(struct parsed_partitions *state)
 {
+	int p;
+
+	for (p = 1; p < state->limit; p++)
+		of_node_put(state->parts[p].np);
+
 	vfree(state->parts);
 	kfree(state);
 }
@@ -571,6 +577,11 @@ static bool blk_add_partition(struct gendisk *disk,
 			       disk->disk_name, p, part);
 		}
 		return true;
+	}
+
+	if (state->parts[p].np) {
+		device_set_node(&part->bd_device,
+				of_fwnode_handle(state->parts[p].np));
 	}
 
 	if (IS_BUILTIN(CONFIG_BLK_DEV_MD) &&

@@ -17,6 +17,7 @@ struct parsed_partitions {
 		int flags;
 		bool has_info;
 		struct partition_meta_info info;
+		struct device_node *np;
 	} *parts;
 	int next;
 	int limit;

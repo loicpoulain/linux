@@ -67,6 +67,8 @@ static void add_of_partition(struct parsed_partitions *state, int slot,
 	strscpy(info->volname, partname, sizeof(info->volname));
 
 	seq_buf_printf(&state->pp_buf, "(%s)", info->volname);
+
+	state->parts[slot].np = of_node_get(np);
 }
 
 int of_partition(struct parsed_partitions *state)
