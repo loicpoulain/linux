@@ -24,7 +24,11 @@ enum camss_ope_params_block_type {
 	CAMSS_OPE_PARAMS_WB_GAIN = 1,
 	CAMSS_OPE_PARAMS_CHROMA_ENHAN = 2,
 	CAMSS_OPE_PARAMS_COLOR_CORRECT = 3,
+	CAMSS_OPE_PARAMS_GAMMA = 4,
 };
+
+/* Number of entries in each gamma channel LUT. */
+#define CAMSS_OPE_GAMMA_LUT_SIZE	256
 
 /**
  * struct camss_ope_params_wb_gain - White Balance gains
@@ -152,9 +156,51 @@ struct camss_ope_params_color_correct {
 	__u16 _pad[3];
 } __attribute__((aligned(8)));
 
+/**
+ * struct camss_ope_params_gamma - per-channel gamma correction curves
+ *
+ * Implements the CLC_GLUT pipeline module, applied in the RGB domain.  It
+ * holds one independent lookup table per colour channel; each table is a
+ * direct (not segmented) map of input level to output level.
+ *
+ * Each table has @CAMSS_OPE_GAMMA_LUT_SIZE (256) entries of 16-bit unsigned
+ * output.  The hardware indexes a table with the most-significant 8 bits of
+ * the channel sample and linearly interpolates between adjacent entries for
+ * sub-index precision, so entry i is the output for input level i/255 of
+ * full scale.  Output is normalised to full scale: 0x0000 = black,
+ * 0xFFFF = white.
+ *
+ * How to fill a curve (same on all three channels for pure luminance
+ * gamma; different curves per channel additionally shift colour balance):
+ *
+ *   Identity (pass-through, gamma 1.0):
+ *     lut[i] = 257 * i;                          // i = 0..255
+ *
+ *   Encode with gamma g (e.g. sRGB-like, g = 2.2):
+ *     lut[i] = round(pow(i / 255.0, 1.0 / g) * 65535.0);
+ *
+ * Entries should be monotonically non-decreasing and stay within
+ * [0, 0xFFFF]; a neutral curve maps lut[0] = 0 and lut[255] = 0xFFFF.
+ *
+ * The module is bypassed unless enabled: set
+ * V4L2_ISP_PARAMS_FL_BLOCK_ENABLE in @header.flags.
+ *
+ * @header:  block header; @header.type = CAMSS_OPE_PARAMS_GAMMA
+ * @glut:    green channel gamma curve (@CAMSS_OPE_GAMMA_LUT_SIZE entries)
+ * @blut:    blue  channel gamma curve
+ * @rlut:    red   channel gamma curve
+ */
+struct camss_ope_params_gamma {
+	struct v4l2_isp_params_block_header header;
+	__u16 glut[CAMSS_OPE_GAMMA_LUT_SIZE];
+	__u16 blut[CAMSS_OPE_GAMMA_LUT_SIZE];
+	__u16 rlut[CAMSS_OPE_GAMMA_LUT_SIZE];
+} __attribute__((aligned(8)));
+
 #define CAMSS_OPE_PARAMS_MAX_PAYLOAD		\
 	(sizeof(struct camss_ope_params_wb_gain)	+\
 	 sizeof(struct camss_ope_params_chroma_enhan)	+\
-	 sizeof(struct camss_ope_params_color_correct))
+	 sizeof(struct camss_ope_params_color_correct)	+\
+	 sizeof(struct camss_ope_params_gamma))
 
 #endif /* _UAPI_LINUX_CAMSS_OPE_CONFIG_H */

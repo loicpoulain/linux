@@ -210,6 +210,24 @@ struct ope_fmt_state {
 #define OPE_PP_CC_COEFF_M_CFG				(OPE_PP_CC_BASE + 0x8c)
 #define		OPE_PP_CC_COEFF_M_CFG_M		GENMASK(11, 0)
 
+#define OPE_PP_GLUT_BASE			0x1000
+#define OPE_PP_GLUT_DMI_CFG				(OPE_PP_GLUT_BASE + 0x08)
+#define		OPE_PP_GLUT_DMI_CFG_AUTO_LOAD_EN	BIT(20)
+#define		OPE_PP_GLUT_DMI_CFG_ADDR	GENMASK(7, 0)
+#define OPE_PP_GLUT_DMI_LUT_CFG				(OPE_PP_GLUT_BASE + 0x0c)
+#define		OPE_PP_GLUT_DMI_LUT_CFG_SEL	GENMASK(1, 0)
+#define OPE_PP_GLUT_DMI_DATA				(OPE_PP_GLUT_BASE + 0x10)
+#define		OPE_PP_GLUT_DMI_DATA_DATA	GENMASK(31, 0)
+#define OPE_PP_GLUT_DMI_LUT_BANK_CFG			(OPE_PP_GLUT_BASE + 0x58)
+#define		OPE_PP_GLUT_DMI_LUT_BANK_CFG_SEL	BIT(0)
+#define OPE_PP_GLUT_MODULE_LUT_BANK_CFG			(OPE_PP_GLUT_BASE + 0x5c)
+#define		OPE_PP_GLUT_MODULE_LUT_BANK_CFG_SEL	BIT(0)
+#define OPE_PP_GLUT_MODULE_CFG				(OPE_PP_GLUT_BASE + 0x60)
+#define		OPE_PP_GLUT_MODULE_CFG_EN	BIT(0)
+
+/* LUT_SEL values: one per output channel, CH0/CH1/CH2 map to 1/2/3. */
+#define		OPE_PP_GLUT_LUT_SEL_CH(ch)	((ch) + 1)
+
 #define OPE_PP_DEMO_BASE				0x800
 #define OPE_PP_DEMO_MODULE_CFG					(OPE_PP_DEMO_BASE + 0x60)
 #define		OPE_PP_DEMO_MODULE_CFG_EN		BIT(0)
@@ -481,6 +499,7 @@ struct ope_config {
 	struct camss_ope_params_wb_gain		wb_gain;
 	struct camss_ope_params_chroma_enhan	chroma_enhan;
 	struct camss_ope_params_color_correct	color_correct;
+	struct camss_ope_params_gamma		gamma;
 	struct ope_params_demo			demo;
 };
 
@@ -542,6 +561,13 @@ struct ope_ctx {
 	struct ope_config	config;
 	u8			current_stripe;
 	struct ope_stripe	stripe[OPE_MAX_STRIPE];
+
+	/*
+	 * Monotonic generation of the gamma (CLC_GLUT) LUTs.  Bumped every
+	 * time userspace supplies a new gamma block, so the device-global
+	 * bank cache can tell whether a resident bank is still up to date.
+	 */
+	u32			gamma_gen;
 };
 
 /* Per OPE device state */
@@ -574,6 +600,24 @@ struct ope_dev {
 
 	/* Currently active hardware context (set at job start) */
 	struct ope_ctx		*hw_ctx;
+
+	/*
+	 * Gamma (CLC_GLUT) bank cache.  The GLUT LUT SRAM is a device-global
+	 * resource with two hardware banks.  Each entry records which context
+	 * and gamma generation is currently resident in that bank, so a job
+	 * whose gamma is already loaded only needs a bank flip instead of a
+	 * full ~768-word DMI upload.  A SW reset clears the SRAM, so the cache
+	 * is invalidated from the reset-done path (ope_glut_cache_invalidate).
+	 *
+	 * glut_read_bank tracks the bank the hardware is currently reading
+	 * from (MODULE_LUT_BANK_CFG) so uploads target the inactive bank.
+	 */
+	struct {
+		struct ope_ctx	*owner;
+		u32		gen;
+		bool		valid;
+	} glut_bank[2];
+	u8			glut_read_bank;
 };
 
 /* -------- Register accessors -------- */
@@ -1042,6 +1086,120 @@ static void ope_prog_color_correct(struct ope_ctx *ctx, bool force)
 		     FIELD_PREP(OPE_PP_CC_COEFF_M_CFG_M, cc->qfactor));
 }
 
+static void ope_glut_load_lut(struct ope_dev *ope, unsigned int ch, u8 bank,
+			      const u16 *lut)
+{
+	ope_write_pp(ope, OPE_PP_GLUT_DMI_LUT_BANK_CFG,
+		     FIELD_PREP(OPE_PP_GLUT_DMI_LUT_BANK_CFG_SEL, bank));
+	ope_write_pp(ope, OPE_PP_GLUT_DMI_LUT_CFG,
+		     FIELD_PREP(OPE_PP_GLUT_DMI_LUT_CFG_SEL,
+				OPE_PP_GLUT_LUT_SEL_CH(ch)));
+	/*
+	 * Set the start address with auto-increment, then burst the entries.
+	 * Each LUT entry is an 8-bit output value; only the low 8 bits of the
+	 * 16-bit DMI word are significant (the module maps a 12-bit input to
+	 * an 8-bit output, indexing with the top 8 input bits and
+	 * interpolating with the low 4).
+	 */
+	ope_write_pp(ope, OPE_PP_GLUT_DMI_CFG,
+		     OPE_PP_GLUT_DMI_CFG_AUTO_LOAD_EN |
+		     FIELD_PREP(OPE_PP_GLUT_DMI_CFG_ADDR, 0));
+	for (unsigned int i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+		ope_write_pp(ope, OPE_PP_GLUT_DMI_DATA,
+			     FIELD_PREP(OPE_PP_GLUT_DMI_DATA_DATA, lut[i]));
+}
+
+/* Upload all three per-channel LUTs of @ctx into hardware @bank. */
+static void ope_glut_upload(struct ope_ctx *ctx, u8 bank)
+{
+	struct camss_ope_params_gamma *gamma = &ctx->config.gamma;
+	struct ope_dev *ope = ctx->ope;
+
+	ope_glut_load_lut(ope, 0, bank, gamma->glut);
+	ope_glut_load_lut(ope, 1, bank, gamma->blut);
+	ope_glut_load_lut(ope, 2, bank, gamma->rlut);
+
+	ope->glut_bank[bank].owner = ctx;
+	ope->glut_bank[bank].gen   = ctx->gamma_gen;
+	ope->glut_bank[bank].valid = true;
+}
+
+/* True if @bank already holds the current gamma LUTs of @ctx. */
+static bool ope_glut_bank_resident(struct ope_dev *ope, u8 bank,
+				    struct ope_ctx *ctx)
+{
+	return ope->glut_bank[bank].valid &&
+	       ope->glut_bank[bank].owner == ctx &&
+	       ope->glut_bank[bank].gen == ctx->gamma_gen;
+}
+
+/*
+ * Program the gamma (CLC_GLUT) module using the device-global two-bank cache.
+ *
+ * The LUT SRAM has two banks.  If a bank already holds this context's current
+ * gamma we only re-select it (a single MODULE_LUT_BANK_CFG write); otherwise
+ * we upload into the bank the hardware is not currently reading from and then
+ * flip to it.  This turns the common cases -- one context re-tuning, or two
+ * contexts alternating -- into a cheap bank flip instead of a ~768-word DMI
+ * upload.  For three or more contexts cycling every frame the banks thrash and
+ * every job re-uploads, which is unavoidable with only two banks.
+ */
+static void ope_prog_gamma(struct ope_ctx *ctx, bool force)
+{
+	struct camss_ope_params_gamma *gamma = &ctx->config.gamma;
+	bool enable = !(gamma->header.flags & V4L2_ISP_PARAMS_FL_BLOCK_DISABLE);
+	bool dirty  = gamma->header.flags & CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY;
+	struct ope_dev *ope = ctx->ope;
+	u8 bank;
+
+	/* Nothing to do unless forced (new context) or the block changed. */
+	if (!force && !dirty)
+		return;
+
+	gamma->header.flags &= ~CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY;
+
+	if (!enable) {
+		ope_write_pp(ope, OPE_PP_GLUT_MODULE_CFG, 0);
+		return;
+	}
+
+	if (ope_glut_bank_resident(ope, ope->glut_read_bank, ctx)) {
+		/* Already active in the read bank: only (re)enable the module. */
+		bank = ope->glut_read_bank;
+	} else if (ope_glut_bank_resident(ope, !ope->glut_read_bank, ctx)) {
+		/* Resident in the other bank: flip to it, no upload. */
+		bank = !ope->glut_read_bank;
+	} else {
+		/*
+		 * Not resident: upload into the bank the module is not
+		 * currently reading, then flip to it.  Never write the active
+		 * read bank -- MODULE_LUT_BANK_CFG is double-buffered and
+		 * latches on the frame boundary, so writing the live bank can
+		 * race the module sampling it and load a torn table.
+		 */
+		bank = !ope->glut_read_bank;
+		ope_glut_upload(ctx, bank);
+	}
+
+	ope_write_pp(ope, OPE_PP_GLUT_MODULE_LUT_BANK_CFG,
+		     FIELD_PREP(OPE_PP_GLUT_MODULE_LUT_BANK_CFG_SEL, bank));
+	ope->glut_read_bank = bank;
+
+	ope_write_pp(ope, OPE_PP_GLUT_MODULE_CFG, OPE_PP_GLUT_MODULE_CFG_EN);
+}
+
+/*
+ * A SW reset clears the GLUT LUT SRAM, so any cached bank contents are gone.
+ * Called from the reset-done IRQ path to drop ownership records; the read
+ * bank is reset to 0 to match hardware defaults.
+ */
+static void ope_glut_cache_invalidate(struct ope_dev *ope)
+{
+	ope->glut_bank[0].valid = false;
+	ope->glut_bank[1].valid = false;
+	ope->glut_read_bank = 0;
+}
+
 static void ope_prog_crop_rnd_clamp(struct ope_dev *ope, const struct ope_stripe *stripe)
 {
 	static const u32 crop_bases[] = {
@@ -1182,16 +1340,32 @@ static void ope_params_apply_color_correct(void *priv, const union camss_isp_par
 	ctx->config.color_correct.header.flags |= CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY;
 }
 
+static void ope_params_apply_gamma(void *priv, const union camss_isp_params_block *block)
+{
+	struct ope_ctx *ctx = priv;
+
+	ctx->config.gamma = block->gamma;
+	ctx->config.gamma.header.flags |= CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY;
+	/*
+	 * New LUT contents: bump the generation so ope_prog_gamma() knows any
+	 * bank previously loaded for this context is now stale and must be
+	 * re-uploaded rather than merely re-selected.
+	 */
+	ctx->gamma_gen++;
+}
+
 static const struct v4l2_isp_params_block_type_info ope_params_type_info[] = {
 	[CAMSS_OPE_PARAMS_WB_GAIN]      = { sizeof(struct camss_ope_params_wb_gain) },
 	[CAMSS_OPE_PARAMS_CHROMA_ENHAN] = { sizeof(struct camss_ope_params_chroma_enhan) },
 	[CAMSS_OPE_PARAMS_COLOR_CORRECT] = { sizeof(struct camss_ope_params_color_correct) },
+	[CAMSS_OPE_PARAMS_GAMMA]        = { sizeof(struct camss_ope_params_gamma) },
 };
 
 static const camss_isp_params_handler_fn ope_params_handlers[] = {
 	[CAMSS_OPE_PARAMS_WB_GAIN]      = ope_params_apply_wb,
 	[CAMSS_OPE_PARAMS_CHROMA_ENHAN] = ope_params_apply_chroma_enhan,
 	[CAMSS_OPE_PARAMS_COLOR_CORRECT] = ope_params_apply_color_correct,
+	[CAMSS_OPE_PARAMS_GAMMA]        = ope_params_apply_gamma,
 };
 
 static struct vb2_v4l2_buffer *ope_queue_remove(struct ope_ctx *ctx,
@@ -1287,7 +1461,12 @@ static const struct ope_config ope_default_config = {
 		.header.type = CAMSS_OPE_PARAMS_COLOR_CORRECT,
 		.header.flags = V4L2_ISP_PARAMS_FL_BLOCK_DISABLE |
 				CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY,
-	}
+	},
+	.gamma = {
+		.header.type = CAMSS_OPE_PARAMS_GAMMA,
+		.header.flags = V4L2_ISP_PARAMS_FL_BLOCK_DISABLE |
+				CAMSS_ISP_PARAMS_FL_BLOCK_DIRTY,
+	},
 };
 
 static void ope_try_schedule(struct ope_ctx *ctx);
@@ -1377,6 +1556,7 @@ static void ope_run_job(void *priv, bool ctx_changed)
 	ope_prog_wb(ctx, ctx_changed);
 	ope_prog_bayer2rgb(ctx, ctx_changed);
 	ope_prog_color_correct(ctx, ctx_changed);
+	ope_prog_gamma(ctx, ctx_changed);
 	ope_prog_rgb2yuv(ctx, ctx_changed);
 
 	ctx->current_stripe = 0;
@@ -1544,6 +1724,8 @@ static irqreturn_t ope_irq(int irq, void *dev_id)
 
 	if (status & OPE_TOP_IRQ_STATUS_RST_DONE) {
 		dev_dbg(ope->dev, "reset done ctx=%p\n", ctx);
+		/* SW reset clears the GLUT LUT SRAM: drop the bank cache. */
+		ope_glut_cache_invalidate(ope);
 		if (ctx)
 			ope_job_finish(ctx, VB2_BUF_STATE_ERROR);
 		complete(&ope->reset_complete);
@@ -3118,6 +3300,7 @@ static void ope_dump_pipeline(struct ope_dev *ope)
 		{ "wb_gain",	OPE_PP_WB_GAIN_BASE },
 		{ "demo",	OPE_PP_DEMO_BASE },
 		{ "cc",		OPE_PP_CC_BASE },
+		{ "glut",	OPE_PP_GLUT_BASE },
 		{ "chroma_enhan", OPE_PP_CHROMA_ENHAN_BASE },
 		{ "ds_c_pre",	OPE_PP_DOWNSCALE_MN_DS_C_PRE_BASE },
 		{ "ds_y_disp",	OPE_PP_DOWNSCALE_MN_DS_Y_DISP_BASE },

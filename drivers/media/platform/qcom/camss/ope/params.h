@@ -32,6 +32,7 @@ union camss_isp_params_block {
 	struct camss_ope_params_wb_gain         wb_gain;
 	struct camss_ope_params_chroma_enhan   chroma_enhan;
 	struct camss_ope_params_color_correct  color_correct;
+	struct camss_ope_params_gamma          gamma;
 };
 
 typedef void (*camss_isp_params_handler_fn)(void *priv, const union camss_isp_params_block *block);
