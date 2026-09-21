@@ -89,6 +89,16 @@ int v4l2_isp_params_validate_buffer(struct device *dev, struct vb2_buffer *vb,
 			return -EINVAL;
 		}
 
+		/*
+		 * A block must at least cover its own header, otherwise the
+		 * walk below would never advance.
+		 */
+		if (block->size < sizeof(*block)) {
+			dev_dbg(dev, "Invalid block size %u at offset %zu\n",
+				block->size, block_offset);
+			return -EINVAL;
+		}
+
 		/* It's invalid to specify both ENABLE and DISABLE. */
 		if ((block->flags & (V4L2_ISP_PARAMS_FL_BLOCK_ENABLE |
 				     V4L2_ISP_PARAMS_FL_BLOCK_DISABLE)) ==
