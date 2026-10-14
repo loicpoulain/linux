@@ -88,14 +88,18 @@
 #define CCI_IRQ_MASK_1				0xc10
 #define CCI_IRQ_MASK_1_I2C_M0_RD_THRESHOLD	BIT(16)
 #define CCI_IRQ_MASK_1_I2C_M0_RD_PAUSE		BIT(17)
+#define CCI_IRQ_MASK_1_I2C_M0_Q0_CMD_THRESHOLD	BIT(18)
 #define CCI_IRQ_MASK_1_I2C_M1_RD_THRESHOLD	BIT(20)
 #define CCI_IRQ_MASK_1_I2C_M1_RD_PAUSE		BIT(21)
+#define CCI_IRQ_MASK_1_I2C_M1_Q0_CMD_THRESHOLD	BIT(22)
 #define CCI_IRQ_CLEAR_1				0xc14
 #define CCI_IRQ_STATUS_1			0xc18
 #define CCI_IRQ_STATUS_1_I2C_M0_RD_THRESHOLD	BIT(16)
 #define CCI_IRQ_STATUS_1_I2C_M0_RD_PAUSE	BIT(17)
+#define CCI_IRQ_STATUS_1_I2C_M0_Q0_CMD_THRESHOLD	BIT(18)
 #define CCI_IRQ_STATUS_1_I2C_M1_RD_THRESHOLD	BIT(20)
 #define CCI_IRQ_STATUS_1_I2C_M1_RD_PAUSE	BIT(21)
+#define CCI_IRQ_STATUS_1_I2C_M1_Q0_CMD_THRESHOLD	BIT(22)
 
 #define CCI_TIMEOUT	(msecs_to_jiffies(100))
 #define NUM_MASTERS	2
@@ -114,6 +118,7 @@
 #define CCI_I2C_WRITE_MAX_LEN	(CCI_I2C_WRITE_WC * sizeof(u32) - 1)
 #define CCI_I2C_WRITE_NWORDS(len) DIV_ROUND_UP((len) + 1, sizeof(u32))
 #define CCI_I2C_WRITE_BURST	0xf
+#define CCI_I2C_WRITE_BURST_IRQ	0xe
 #define CCI_I2C_BURST_OVERHEAD	4 /* LOCK + SET_PARAM + UNLOCK + REPORT */
 
 /* Largest write that can be bursted through a queue of @qsize words */
@@ -126,6 +131,9 @@
 
 /* Unlimited read via threshold-irq support */
 #define CCI_I2C_READ_BURST_NOLIMIT 0
+
+/* Unlimited write via command-queue threshold-irq support */
+#define CCI_I2C_WRITE_BURST_NOLIMIT 0
 
 enum {
 	I2C_MODE_STANDARD,
@@ -192,16 +200,21 @@ struct cci {
 	spinlock_t threshold_lock;
 };
 
-static bool cci_has_threshold_irq(const struct cci *cci)
+static bool cci_has_read_threshold_irq(const struct cci *cci)
 {
 	return cci->data->quirks.max_read_len == CCI_I2C_READ_BURST_NOLIMIT;
+}
+
+static bool cci_has_write_threshold_irq(const struct cci *cci)
+{
+	return cci->data->quirks.max_write_len == CCI_I2C_WRITE_BURST_NOLIMIT;
 }
 
 static void cci_set_rd_threshold_irq(struct cci *cci, u16 master, bool enable)
 {
 	u32 bits, val;
 
-	if (!cci_has_threshold_irq(cci))
+	if (!cci_has_read_threshold_irq(cci))
 		return;
 
 	guard(spinlock_irqsave)(&cci->threshold_lock);
@@ -229,7 +242,7 @@ static irqreturn_t cci_isr(int irq, void *dev)
 	val = readl(cci->base + CCI_IRQ_STATUS_0);
 	writel(val, cci->base + CCI_IRQ_CLEAR_0);
 
-	if (cci_has_threshold_irq(cci)) {
+	if (cci_has_read_threshold_irq(cci) || cci_has_write_threshold_irq(cci)) {
 		val1 = readl(cci->base + CCI_IRQ_STATUS_1);
 		writel(val1, cci->base + CCI_IRQ_CLEAR_1);
 	}
@@ -278,6 +291,16 @@ static irqreturn_t cci_isr(int irq, void *dev)
 
 	if (val1 & CCI_IRQ_STATUS_1_I2C_M1_RD_PAUSE) {
 		dev_warn_ratelimited(cci->dev, "master 1 read paused (fifo full)\n");
+		ret = IRQ_HANDLED;
+	}
+
+	if (val1 & CCI_IRQ_STATUS_1_I2C_M0_Q0_CMD_THRESHOLD) {
+		complete(&cci->master[0].irq_complete);
+		ret = IRQ_HANDLED;
+	}
+
+	if (val1 & CCI_IRQ_STATUS_1_I2C_M1_Q0_CMD_THRESHOLD) {
+		complete(&cci->master[1].irq_complete);
 		ret = IRQ_HANDLED;
 	}
 
@@ -474,8 +497,12 @@ static int cci_init(struct cci *cci)
 
 	val = 0;
 
-	if (cci_has_threshold_irq(cci))
+	if (cci_has_read_threshold_irq(cci))
 		val |= CCI_IRQ_MASK_1_I2C_M0_RD_PAUSE | CCI_IRQ_MASK_1_I2C_M1_RD_PAUSE;
+
+	if (cci_has_write_threshold_irq(cci))
+		val |= CCI_IRQ_MASK_1_I2C_M0_Q0_CMD_THRESHOLD |
+		       CCI_IRQ_MASK_1_I2C_M1_Q0_CMD_THRESHOLD;
 
 	if (val)
 		writel(val, cci->base + CCI_IRQ_MASK_1);
@@ -509,7 +536,7 @@ static int cci_init(struct cci *cci)
 		val = hw->scl_stretch_en << 8 | hw->trdhld << 4 | hw->tsp;
 		writel(val, cci->base + CCI_I2C_Mm_MISC_CTL(i));
 
-		if (cci_has_threshold_irq(cci)) {
+		if (cci_has_read_threshold_irq(cci)) {
 			/* Hardware supporting the RD_THRESHOLD interrupt provides a minimum FIFO
 			 * depth of 64 words, with the threshold reset to the full FIFO size by
 			 * default. Configure the threshold to half the FIFO depth to allow burst
@@ -543,16 +570,18 @@ static int cci_reset(struct cci *cci)
 	return cci_init(cci);
 }
 
-static int cci_run_queue(struct cci *cci, u8 master, u8 queue)
+static int cci_run_queue(struct cci *cci, u8 master, u8 queue, u32 words)
 {
-	u32 val;
-
-	val = readl(cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, queue));
-	writel(val, cci->base + CCI_I2C_Mm_Qn_EXEC_WORD_CNT(master, queue));
-
+	/*
+	 * Arm the completion before the words are made visible to the
+	 * hardware. A burst write refills a queue that is still executing, so
+	 * the command that raises the next interrupt can be reached as soon as
+	 * the execution window is extended.
+	 */
 	reinit_completion(&cci->master[master].irq_complete);
-	val = BIT(master * 2 + queue);
-	writel(val, cci->base + CCI_QUEUE_START);
+
+	writel(words, cci->base + CCI_I2C_Mm_Qn_EXEC_WORD_CNT(master, queue));
+	writel(BIT(master * 2 + queue), cci->base + CCI_QUEUE_START);
 
 	if (!wait_for_completion_timeout(&cci->master[master].irq_complete,
 					 CCI_TIMEOUT)) {
@@ -567,19 +596,19 @@ static int cci_run_queue(struct cci *cci, u8 master, u8 queue)
 
 static int cci_validate_queue(struct cci *cci, u8 master, u8 queue)
 {
-	u32 val;
+	u32 val, words;
 
-	val = readl(cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, queue));
-	if (val == cci->data->queue_size[queue])
+	words = readl(cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, queue));
+	if (words == cci->data->queue_size[queue])
 		return -EINVAL;
 
-	if (!val)
+	if (!words)
 		return 0;
 
 	val = CCI_I2C_REPORT | CCI_I2C_REPORT_IRQ_EN;
 	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
 
-	return cci_run_queue(cci, master, queue);
+	return cci_run_queue(cci, master, queue, words + 1);
 }
 
 /*
@@ -666,15 +695,16 @@ static int cci_i2c_read(struct cci *cci, u16 master,
 	return 0;
 }
 
-static void cci_i2c_load_write(void __iomem *loadq, u8 *buf, u16 len, bool burst)
+static void cci_i2c_load_write(void __iomem *loadq, u8 *buf, u16 len, u8 opcode)
 {
 	u32 cmd[CCI_I2C_WRITE_WC] = { };
+	bool burst = opcode == CCI_I2C_WRITE_BURST || opcode == CCI_I2C_WRITE_BURST_IRQ;
 
 	if (WARN_ON(len > CCI_I2C_WRITE_MAX_LEN ||
 		    (burst && len != CCI_I2C_WRITE_MAX_LEN)))
 		return;
 
-	cmd[0] = CCI_I2C_WRITE | (burst ? CCI_I2C_WRITE_BURST : len) << 4;
+	cmd[0] = CCI_I2C_WRITE | opcode << 4;
 	memcpy((u8 *)cmd + 1, buf, len);
 	iowrite32_rep(loadq, cmd, CCI_I2C_WRITE_NWORDS(len));
 }
@@ -683,11 +713,18 @@ static int cci_i2c_write(struct cci *cci, u16 master,
 			 u16 addr, u8 *buf, u16 len)
 {
 	void __iomem *loadq = cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, QUEUE_0);
+	void __iomem *cntq = cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, QUEUE_0);
+	bool split = cci_has_write_threshold_irq(cci);
+	u32 qsize = cci->data->queue_size[QUEUE_0];
 	bool burst = len > CCI_I2C_WRITE_MAX_LEN;
+	/* words held back for the trailing REPORT, plus UNLOCK when locked */
+	u32 reserve = burst ? 2 : 1;
+	u32 pending = 0, chunk = 0, round_max = U32_MAX, mark = 0, used = 0;
+	bool marked = false;
 	int ret;
 	u32 val;
 
-	dev_dbg(cci->dev, "master %d write: len=%u\n", master, len);
+	cci_clear_status(cci, master);
 
 	/*
 	 * Call validate queue to make sure queue is empty before starting.
@@ -697,27 +734,97 @@ static int cci_i2c_write(struct cci *cci, u16 master,
 	if (ret < 0)
 		return ret;
 
-	if (burst)
+	if (burst) {
 		writel(CCI_I2C_LOCK, loadq);
+		pending++;
+	}
 
 	val = CCI_I2C_SET_PARAM | (addr & 0x7f) << 4;
 	writel(val, loadq);
+	pending++;
 
 	do {
+		u32 chunks_left = DIV_ROUND_UP(len, CCI_I2C_WRITE_MAX_LEN);
 		u16 to_write = min_t(u16, len, CCI_I2C_WRITE_MAX_LEN);
+		u8 opcode;
 
-		len -= to_write;
-		cci_i2c_load_write(loadq, buf, to_write, len > 0);
+		/*
+		 * Hardware with the command-queue threshold interrupt can
+		 * split a write too large for the queue into several rounds.
+		 * Fill all the space the queue reports free, and mark the
+		 * command that takes the queue past half full so the marker
+		 * fires once everything ahead of it is consumed.
+		 */
+		if (split && !chunk) {
+			u32 half = qsize / 2;
+			u32 avail;
+
+			used = readl(cntq);
+			avail = used + reserve < qsize ? qsize - used - reserve : 0;
+
+			round_max = avail / CCI_I2C_WRITE_WC;
+			if (WARN_ON(!round_max)) {
+				ret = -EIO;
+				goto err;
+			}
+
+			mark = used < half ?
+			       DIV_ROUND_UP(half - used, CCI_I2C_WRITE_WC) : 0;
+			mark = min(mark, round_max - 1);
+			/* only mark a round that cannot finish the transfer */
+			marked = chunks_left > round_max;
+		}
+
+		if (marked && chunk == mark)
+			opcode = CCI_I2C_WRITE_BURST_IRQ;
+		else if (chunks_left > 1)
+			opcode = CCI_I2C_WRITE_BURST;
+		else
+			opcode = to_write;
+
+		cci_i2c_load_write(loadq, buf, to_write, opcode);
 		buf += to_write;
-	} while (len);
+		len -= to_write;
+		pending += CCI_I2C_WRITE_NWORDS(to_write);
+		chunk++;
 
-	if (burst)
-		writel(CCI_I2C_UNLOCK, loadq);
+		if (len && chunk == round_max) {
+			/* Queue is full, wait for the burst irq event */
+			ret = cci_run_queue(cci, master, QUEUE_0, pending);
+			if (ret)
+				goto err;
+
+			pending = 0;
+			chunk = 0;
+		}
+	} while (len);
 
 	val = CCI_I2C_REPORT | CCI_I2C_REPORT_IRQ_EN;
 	writel(val, loadq);
+	pending++;
 
-	return cci_run_queue(cci, master, QUEUE_0);
+	if (burst) {
+		writel(CCI_I2C_UNLOCK, loadq);
+		pending++;
+	}
+
+	ret = cci_run_queue(cci, master, QUEUE_0, pending);
+	if (ret)
+		goto err;
+
+	return 0;
+
+err:
+	/*
+	 * An error aborts the queue through HALT_REQ, whose acknowledge resets
+	 * the master behind cci_init()'s back and so drops the interrupt masks.
+	 * Reset explicitly to get them reprogrammed before the next transfer.
+	 * A timeout has already been reset by cci_run_queue().
+	 */
+	if (ret != -ETIMEDOUT)
+		cci_reset(cci);
+
+	return ret;
 }
 
 static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
@@ -892,7 +999,7 @@ static const struct cci_data cci_hw_catalog[] = {
 		.max_mode = I2C_MODE_FAST_PLUS,
 		.queue_size = { 128, 32 },
 		.quirks = {
-			.max_write_len = CCI_I2C_BURST_MAX_LEN(128),
+			.max_write_len = CCI_I2C_WRITE_BURST_NOLIMIT,
 			.max_read_len = CCI_I2C_READ_BURST_NOLIMIT,
 		},
 	},
@@ -901,7 +1008,7 @@ static const struct cci_data cci_hw_catalog[] = {
 		.max_mode = I2C_MODE_FAST_PLUS,
 		.queue_size = { 1024, 32 },
 		.quirks = {
-			.max_write_len = CCI_I2C_BURST_MAX_LEN(1024),
+			.max_write_len = CCI_I2C_WRITE_BURST_NOLIMIT,
 			.max_read_len = CCI_I2C_READ_BURST_NOLIMIT,
 		},
 	},
