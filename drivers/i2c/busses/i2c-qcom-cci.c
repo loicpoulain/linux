@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_qos.h>
 #include <linux/spinlock.h>
 
 #define CCI_HW_VERSION				0x0
@@ -104,6 +105,15 @@
 #define CCI_TIMEOUT	(msecs_to_jiffies(100))
 #define NUM_MASTERS	2
 #define NUM_QUEUES	2
+
+/*
+ * A burst write that outgrows the command queue holds the I2C transaction open
+ * while software refills it, and the hardware aborts the transfer if the queue
+ * runs dry. That deadline is dominated by the time it takes the CPU to leave
+ * an idle state, so constrain it for the duration of such a transfer. The
+ * value only needs to exclude the deep states.
+ */
+#define CCI_BURST_QOS_LATENCY_US	100
 
 /*
  * A command word is a 4-bit opcode followed by an opcode specific payload.
@@ -207,8 +217,11 @@ struct cci {
 	int nclocks;
 	struct clk *cci_clk;
 	struct cci_master master[NUM_MASTERS];
-	/* Protects read-modify-write access to CCI_IRQ_MASK_1 */
-	spinlock_t threshold_lock;
+	/*
+	 * Protects read-modify-write access to CCI_IRQ_MASK_1. Raw because it
+	 * is taken by the non-threaded interrupt handler.
+	 */
+	raw_spinlock_t threshold_lock;
 };
 
 static bool cci_has_read_threshold_irq(const struct cci *cci)
@@ -228,7 +241,7 @@ static void cci_set_rd_threshold_irq(struct cci *cci, u16 master, bool enable)
 	if (!cci_has_read_threshold_irq(cci))
 		return;
 
-	guard(spinlock_irqsave)(&cci->threshold_lock);
+	guard(raw_spinlock_irqsave)(&cci->threshold_lock);
 
 	bits = master ? CCI_IRQ_MASK_1_I2C_M1_RD_THRESHOLD :
 			CCI_IRQ_MASK_1_I2C_M0_RD_THRESHOLD;
@@ -718,8 +731,8 @@ static void cci_i2c_load_write(void __iomem *loadq, u8 *buf, u16 len, u8 opcode)
 	iowrite32_rep(loadq, cmd, CCI_I2C_WRITE_NWORDS(len));
 }
 
-static int cci_i2c_write(struct cci *cci, u16 master,
-			 u16 addr, u8 *buf, u16 len)
+static int __cci_i2c_write(struct cci *cci, u16 master,
+			   u16 addr, u8 *buf, u16 len)
 {
 	void __iomem *loadq = cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, QUEUE_0);
 	void __iomem *cntq = cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, QUEUE_0);
@@ -843,6 +856,33 @@ err:
 	 */
 	if (ret != -ETIMEDOUT)
 		cci_reset(cci);
+
+	return ret;
+}
+
+static int cci_i2c_write(struct cci *cci, u16 master,
+			 u16 addr, u8 *buf, u16 len)
+{
+	/* zeroed: cpu_latency_qos_add_request() inspects the handle first */
+	struct pm_qos_request qos_req = { };
+	bool qos;
+	int ret;
+
+	/*
+	 * Only a write too large for the command queue has to be refilled while
+	 * the hardware is executing it, and only that case is sensitive to
+	 * idle-state exit latency. Shorter writes are rejected by the I2C core
+	 * on hardware without the command-queue threshold interrupt, so the
+	 * length alone selects the transfers that can refill.
+	 */
+	qos = len > CCI_I2C_BURST_MAX_LEN(cci->data->queue_size[QUEUE_0]);
+	if (qos)
+		cpu_latency_qos_add_request(&qos_req, CCI_BURST_QOS_LATENCY_US);
+
+	ret = __cci_i2c_write(cci, master, addr, buf, len);
+
+	if (qos)
+		cpu_latency_qos_remove_request(&qos_req);
 
 	return ret;
 }
@@ -1076,7 +1116,7 @@ static int cci_probe(struct platform_device *pdev)
 	cci->dev = dev;
 	platform_set_drvdata(pdev, cci);
 
-	spin_lock_init(&cci->threshold_lock);
+	raw_spin_lock_init(&cci->threshold_lock);
 
 	for_each_available_child_of_node(dev->of_node, child) {
 		struct cci_master *master;
@@ -1159,7 +1199,15 @@ static int cci_probe(struct platform_device *pdev)
 		goto disable_clocks;
 	cci->irq = ret;
 
-	ret = devm_request_irq(dev, cci->irq, cci_isr, 0, dev_name(dev), cci);
+	/*
+	 * The handler must not be threaded: a burst write refills the command
+	 * queue from the context woken by this interrupt, and the hardware
+	 * aborts the transfer if the queue runs dry. Forced threading, which
+	 * PREEMPT_RT enables for every interrupt, inserts a second scheduler
+	 * wakeup into that deadline.
+	 */
+	ret = devm_request_irq(dev, cci->irq, cci_isr, IRQF_NO_THREAD,
+			       dev_name(dev), cci);
 	if (ret < 0) {
 		dev_err(dev, "request_irq failed, ret: %d\n", ret);
 		goto disable_clocks;
