@@ -632,15 +632,28 @@ out_unlock:
 }
 
 /*
- * The first output starts the line. The others run only while their video
- * node is streaming, and only if they write to memory.
+ * An output runs while the video node it feeds streams, and only if it has a
+ * write master to write with.
+ *
+ * The video nodes of one line start and stop independently of each other, so
+ * every enable and disable of the line brings its outputs in line with what
+ * the nodes currently ask for rather than starting or stopping all of them.
  */
-static bool vfe_output_wanted(struct vfe_line *line, struct vfe_output *output)
+static bool vfe_output_wanted(struct vfe_output *output)
 {
-	if (output == &line->output[0])
-		return true;
+	return output->wm_num && output->video_out.streaming;
+}
 
-	return output->wm_num && vb2_is_streaming(&output->video_out.vb2_q);
+/* Whether any output of the line is still running */
+static bool vfe_line_running(struct vfe_line *line)
+{
+	unsigned int i;
+
+	for (i = 0; i < line->num_outputs; i++)
+		if (line->output[i].state == VFE_OUTPUT_ON)
+			return true;
+
+	return false;
 }
 
 static int vfe_enable_one_output(struct vfe_line *line, struct vfe_output *output)
@@ -693,7 +706,7 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	unsigned long flags;
 	unsigned int frame_skip = 0;
 	unsigned int i;
-	int ret;
+	int ret = 0;
 
 	sensor_pad = camss_find_sensor_pad(&line->subdev.entity);
 	if (sensor_pad) {
@@ -711,10 +724,13 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	ops->reg_update_clear(vfe, line->id);
 
 	for (i = 0; i < line->num_outputs; i++) {
-		if (!vfe_output_wanted(line, &line->output[i]))
+		struct vfe_output *output = &line->output[i];
+
+		/* Leave the outputs that already run, start the new ones */
+		if (output->state == VFE_OUTPUT_ON || !vfe_output_wanted(output))
 			continue;
 
-		ret = vfe_enable_one_output(line, &line->output[i]);
+		ret = vfe_enable_one_output(line, output);
 		if (ret)
 			break;
 	}
@@ -773,8 +789,13 @@ int vfe_enable_v2(struct vfe_line *line)
 {
 	struct vfe_device *vfe = to_vfe(line);
 	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+	bool first;
 	int ret;
 
+	/*
+	 * Serialise the video nodes of a line against each other: each of them
+	 * enables the line, and only the first one to do so reserves it.
+	 */
 	mutex_lock(&vfe->stream_lock);
 
 	if (vfe->res->hw_ops->enable_irq)
@@ -782,11 +803,12 @@ int vfe_enable_v2(struct vfe_line *line)
 
 	vfe->stream_count++;
 
-	mutex_unlock(&vfe->stream_lock);
-
-	ret = vfe_get_output_v2(line);
-	if (ret < 0)
-		goto error_get_output;
+	first = !vfe_line_running(line);
+	if (first) {
+		ret = vfe_get_output_v2(line);
+		if (ret < 0)
+			goto error_get_output;
+	}
 
 	ret = vfe_enable_output_v2(line);
 	if (ret < 0)
@@ -794,14 +816,15 @@ int vfe_enable_v2(struct vfe_line *line)
 
 	vfe->was_streaming = 1;
 
+	mutex_unlock(&vfe->stream_lock);
+
 	return 0;
 
 error_enable_output:
-	vfe_put_output(line);
+	if (first)
+		vfe_put_output(line);
 
 error_get_output:
-	mutex_lock(&vfe->stream_lock);
-
 	vfe->stream_count--;
 
 	mutex_unlock(&vfe->stream_lock);
@@ -980,8 +1003,8 @@ static void vfe_disable_output(struct vfe_line *line)
 	for (o = 0; o < line->num_outputs; o++) {
 		struct vfe_output *output = &line->output[o];
 
-		/* the first output is always on; the others only if they streamed */
-		if (o && output->state != VFE_OUTPUT_ON)
+		/* Stop the outputs whose video node stopped, leave the rest */
+		if (output->state != VFE_OUTPUT_ON || vfe_output_wanted(output))
 			continue;
 
 		if (ops->vfe_output_stop)
@@ -990,6 +1013,7 @@ static void vfe_disable_output(struct vfe_line *line)
 			for (i = 0; i < output->wm_num; i++)
 				ops->vfe_wm_stop(vfe, output->wm[i].bus_client, line);
 		output->gen2.active_num = 0;
+		output->state = VFE_OUTPUT_OFF;
 	}
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 }
@@ -1005,11 +1029,13 @@ int vfe_disable(struct vfe_line *line)
 	struct vfe_device *vfe = to_vfe(line);
 	int ret = 0;
 
+	mutex_lock(&vfe->stream_lock);
+
 	vfe_disable_output(line);
 
-	vfe_put_output(line);
-
-	mutex_lock(&vfe->stream_lock);
+	/* Release the line once its last video node has stopped */
+	if (!vfe_line_running(line))
+		vfe_put_output(line);
 
 	if (--vfe->stream_count == 0)
 		ret = vfe_reset(vfe);
@@ -1421,7 +1447,13 @@ static int vfe_set_stream(struct v4l2_subdev *sd, int enable)
 	int ret;
 
 	if (enable) {
-		line->output[0].state = VFE_OUTPUT_RESERVED;
+		/*
+		 * Reserve the image output so a VFE that masks its interrupts
+		 * per line sees this line coming up, but leave it alone if
+		 * another video node of the line is already streaming.
+		 */
+		if (line->output[0].state != VFE_OUTPUT_ON)
+			line->output[0].state = VFE_OUTPUT_RESERVED;
 		ret = vfe->res->hw_ops->vfe_enable(line);
 		if (ret < 0)
 			dev_err(vfe->camss->dev,
