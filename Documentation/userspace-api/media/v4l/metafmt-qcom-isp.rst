@@ -169,6 +169,14 @@ the blocks by the size member of each header and skips types it does not know.
 The SM8650 IFE pixel path produces the AEC Bayer histogram,
 :c:type:`camss_stats_bhist`, on its ``msm_vfeN_stats`` metadata capture node.
 
+The QCM2290 TFE pixel path produces a Bayer histogram of its own,
+:c:type:`camss_stats_bhist_quad`, on the same node. Rather than histogramming
+the luma of a quad it counts each position inside the 2x2 Bayer quad into a
+histogram of its own, so its counts are indexed by bin and by the
+``CAMSS_STATS_BHIST_QUAD_*`` position a sample was taken from. The hardware is
+not told the Bayer order of its input, so which colour a position carries
+follows the media bus code the pipeline is configured for.
+
 The following example reads the AEC Bayer histogram from a statistics buffer:
 
 .. code-block:: c

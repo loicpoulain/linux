@@ -217,9 +217,12 @@ struct camss_params_gamma {
  * of &struct v4l2_isp_block_header.
  *
  * @CAMSS_STATS_AEC_BHIST: AEC Bayer histogram, &struct camss_stats_bhist
+ * @CAMSS_STATS_BHIST: Bayer histogram taken per quad position,
+ *	&struct camss_stats_bhist_quad
  */
 enum camss_stats_block_type {
 	CAMSS_STATS_AEC_BHIST = 1,
+	CAMSS_STATS_BHIST = 2,
 };
 
 /* Number of bins in a Bayer histogram. */
@@ -240,6 +243,58 @@ struct camss_stats_bhist {
 	__u32 bins[CAMSS_STATS_BHIST_BINS];
 } __attribute__((aligned(8)));
 
-#define CAMSS_STATS_MAX_PAYLOAD		sizeof(struct camss_stats_bhist)
+/* Number of bins in each position's histogram of a per-quad Bayer histogram. */
+#define CAMSS_STATS_BHIST_QUAD_BINS	256
+
+/*
+ * Position inside the 2x2 Bayer quad a count belongs to, indexing
+ * &camss_stats_bhist_quad.bins.
+ *
+ * The histogram is taken before any colour processing and the hardware is not
+ * told the Bayer order of its input, so a position is a position and not a
+ * colour: which colour it carries follows the media bus code of the data. For
+ * MEDIA_BUS_FMT_SRGGB8_1X8, TL is red, BR is blue, TR is the green of the red
+ * row and BL the green of the blue row; for MEDIA_BUS_FMT_SBGGR8_1X8 the reds
+ * and blues trade places.
+ *
+ * The order the positions come in is the order the hardware writes its four
+ * channels in, which is red, blue, then the two greens, as the other Bayer
+ * statistics of this hardware use as well. That is the order below once the
+ * channels are read as the positions they occupy in RGGB data.
+ */
+#define CAMSS_STATS_BHIST_QUAD_TL	0
+#define CAMSS_STATS_BHIST_QUAD_BR	1
+#define CAMSS_STATS_BHIST_QUAD_TR	2
+#define CAMSS_STATS_BHIST_QUAD_BL	3
+#define CAMSS_STATS_BHIST_QUAD_POS	4
+
+/**
+ * struct camss_stats_bhist_quad - Bayer histogram taken per quad position
+ *
+ * Histogram of the pixel values inside the histogram's region, counted
+ * separately for each position of a 2x2 Bayer quad over
+ * CAMSS_STATS_BHIST_QUAD_BINS equal bins spanning the input range. Every
+ * position takes one sample per quad of the region, so each of them
+ * accumulates as many samples as the region holds quads.
+ *
+ * A count is 24 bits wide, the top eight bits of each word reading as zero. A
+ * bin holds at most as many samples as the region has quads, so only a region
+ * of more than 16M quads, far larger than any frame the hardware takes, could
+ * saturate one.
+ *
+ * @header: block header; @header.type = CAMSS_STATS_BHIST
+ * @bins:   number of samples, by bin and by CAMSS_STATS_BHIST_QUAD_* position
+ */
+struct camss_stats_bhist_quad {
+	struct v4l2_isp_block_header header;
+	__u32 bins[CAMSS_STATS_BHIST_QUAD_BINS][CAMSS_STATS_BHIST_QUAD_POS];
+} __attribute__((aligned(8)));
+
+/*
+ * Upper bound on the data[] of a statistics buffer. A buffer carries the
+ * blocks of the engine that produced it, and no engine produces more than one
+ * Bayer histogram; both flavours are the same size.
+ */
+#define CAMSS_STATS_MAX_PAYLOAD		sizeof(struct camss_stats_bhist_quad)
 
 #endif /* _UAPI_LINUX_QCOM_CAMSS_CONFIG_H */
