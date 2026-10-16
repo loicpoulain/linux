@@ -72,6 +72,7 @@ struct vfe_wm {
 
 struct vfe_output {
 	u8 pad;			/* index into line->pads[] this output serves */
+	u8 stats_block;		/* camss_stats_block_type a statistics output produces */
 	u8 comp_group;
 	u8 wm_num;
 	struct vfe_wm wm[VFE_MAX_WM_PER_OUTPUT];
@@ -367,7 +368,8 @@ void vfe_add_yuv(struct vfe_output *output, u8 bus_client_y,
 void vfe_add_ds(struct vfe_output *output, u8 pad, u8 bus_client,
 		u8 comp_group);
 
-void vfe_add_stats(struct vfe_output *output, u8 bus_client, u8 comp_group);
+void vfe_add_stats(struct vfe_output *output, u8 bus_client, u8 comp_group,
+		   u8 stats_block);
 int vfe_alloc_stats(struct vfe_device *vfe, struct vfe_output *output);
 
 void vfe_add_params(struct vfe_output *output, u8 comp_group);

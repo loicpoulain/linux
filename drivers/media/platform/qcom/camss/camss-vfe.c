@@ -451,22 +451,39 @@ u32 vfe_hw_version(struct vfe_device *vfe)
  */
 static const struct v4l2_isp_stats_block_type_info vfe_stats_block_info[] = {
 	[CAMSS_STATS_AEC_BHIST] = { .size = sizeof(struct camss_stats_bhist) },
+	[CAMSS_STATS_BHIST] = { .size = sizeof(struct camss_stats_bhist_quad) },
 };
+
+static_assert(sizeof(struct camss_stats_bhist) <= CAMSS_STATS_MAX_PAYLOAD);
 
 /*
  * vfe_alloc_stats - Allocate the write master target of a statistics output
  * @vfe: VFE device
  * @output: statistics output
  *
- * Write master addresses are 256 byte aligned and the v4l2-isp block payloads
- * are not, so statistics are written to a kernel buffer and copied into the
+ * Write master addresses are aligned to at least 256 bytes, while a block
+ * payload starts a buffer header and a block header into the userspace buffer,
+ * so statistics are written to a page aligned kernel buffer and copied into the
  * userspace buffer when their completion group fires.
  *
- * Return 0 on success or -ENOMEM
+ * The buffer holds the payload of the block the output produces, the block
+ * header being written by the serialisation and not by the hardware.
+ *
+ * Return 0 on success, -EINVAL if the output names a block this driver does
+ * not serialise or -ENOMEM
  */
 int vfe_alloc_stats(struct vfe_device *vfe, struct vfe_output *output)
 {
-	output->dma_size = sizeof_field(struct camss_stats_bhist, bins);
+	size_t block_size;
+
+	if (output->stats_block >= ARRAY_SIZE(vfe_stats_block_info))
+		return -EINVAL;
+
+	block_size = vfe_stats_block_info[output->stats_block].size;
+	if (!block_size)
+		return -EINVAL;
+
+	output->dma_size = block_size - sizeof(struct v4l2_isp_block_header);
 	output->dma_vaddr = dmam_alloc_coherent(vfe->camss->dev,
 						output->dma_size,
 						&output->dma_addr, GFP_KERNEL);
@@ -488,19 +505,17 @@ static void vfe_stats_fill(struct vfe_device *vfe, struct vfe_output *output,
 {
 	struct v4l2_isp_buffer *stats = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
 	struct v4l2_isp_block_header *block;
-	struct camss_stats_bhist *bhist;
 
 	v4l2_isp_stats_init_buffer(stats, V4L2_ISP_VERSION_V1);
 
 	block = v4l2_isp_stats_init_block(vfe->camss->dev, stats,
 					  vfe_stats_block_info,
 					  ARRAY_SIZE(vfe_stats_block_info),
-					  CAMSS_STATS_AEC_BHIST,
+					  output->stats_block,
 					  CAMSS_STATS_MAX_PAYLOAD);
-	if (!IS_ERR(block)) {
-		bhist = container_of(block, struct camss_stats_bhist, header);
-		memcpy(bhist->bins, output->dma_vaddr, sizeof(bhist->bins));
-	}
+	/* The payload follows the block header, as it does in the kernel buffer */
+	if (!IS_ERR(block))
+		memcpy(block + 1, output->dma_vaddr, output->dma_size);
 
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0,
 			      v4l2_isp_buffer_size(stats->data_size));
@@ -2531,9 +2546,11 @@ void vfe_add_ds(struct vfe_output *output, u8 pad, u8 bus_client,
 	vfe_add_output(output, pad, comp_group, 1, &bus_client);
 }
 
-void vfe_add_stats(struct vfe_output *output, u8 bus_client, u8 comp_group)
+void vfe_add_stats(struct vfe_output *output, u8 bus_client, u8 comp_group,
+		   u8 stats_block)
 {
 	vfe_add_output(output, MSM_VFE_PAD_SRC_STATS, comp_group, 1, &bus_client);
+	output->stats_block = stats_block;
 }
 
 void vfe_add_params(struct vfe_output *output, u8 comp_group)
