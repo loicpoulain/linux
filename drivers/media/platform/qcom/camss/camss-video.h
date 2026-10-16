@@ -44,6 +44,8 @@ struct camss_video {
 	const struct camss_video_ops *ops;
 	struct mutex lock;
 	struct mutex q_lock;
+	/* Set around the s_stream() of the subdevices feeding this node */
+	bool streaming;
 	unsigned int bpl_alignment;
 	unsigned int line_based;
 	const struct camss_format_info *formats;

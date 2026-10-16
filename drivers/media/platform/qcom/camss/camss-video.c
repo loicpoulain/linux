@@ -303,11 +303,21 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret < 0)
 		goto error;
 
+	/*
+	 * Publish the node before starting its line: a line serving several
+	 * video nodes only enables the outputs the streaming nodes ask for,
+	 * and this node is about to become one of them.
+	 */
+	video->streaming = true;
+
 	ret = video_pipeline_s_stream(video, 1);
 	if (ret < 0)
-		goto error;
+		goto error_stream;
 
 	return 0;
+
+error_stream:
+	video->streaming = false;
 
 error:
 	video_device_pipeline_stop(vdev);
@@ -323,6 +333,8 @@ static void video_stop_streaming(struct vb2_queue *q)
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
 	int ret;
+
+	video->streaming = false;
 
 	ret = video_pipeline_s_stream(video, 0);
 	if (ret) {
