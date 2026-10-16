@@ -214,6 +214,14 @@ static int video_check_format(struct camss_video *video)
 	struct v4l2_pix_format_mplane *sd_pix = &format.fmt.pix_mp;
 	int ret;
 
+	/*
+	 * A metadata node has no image format to match against its source: the
+	 * size of its buffers comes from the source itself. Only the link to
+	 * that source has to be in place.
+	 */
+	if (video->type == V4L2_BUF_TYPE_META_CAPTURE)
+		return video_remote_subdev(video, NULL) ? 0 : -EPIPE;
+
 	sd_pix->pixelformat = pix->pixelformat;
 	ret = video_get_subdev_format(video, &format);
 	if (ret < 0)
@@ -255,8 +263,10 @@ static int video_prepare_streaming(struct vb2_queue *q)
  * @video: Camss video device
  * @enable: Requested streaming state
  *
- * Walk the chain of subdevices from the video node up to the sensor, asking
- * each of them for the requested streaming state.
+ * Walk the chain of subdevices from the video node up to the sensor. A line
+ * that feeds several video nodes walks the same chain once per node, so the
+ * subdevices along it are asked to stream while they may already be
+ * streaming.
  *
  * Return 0 on success or a negative error code otherwise
  */
@@ -369,9 +379,10 @@ static const struct vb2_ops msm_video_vb2_q_ops = {
 /* -----------------------------------------------------------------------------
  * Metadata capture queue operations
  *
- * A metadata capture node follows the image node of its line: the line starts
- * and stops with the image node, and the node only provides buffers. The
- * kernel fills them by CPU, so they are vmalloc backed.
+ * A metadata capture node starts and stops the line that feeds it, exactly as
+ * an image node does, so statistics can be captured whether or not the image
+ * node of the same line is streaming. Only the buffers differ: the kernel
+ * fills them by CPU, so they are vmalloc backed.
  */
 
 static int video_meta_queue_setup(struct vb2_queue *q,
@@ -406,25 +417,13 @@ static int video_meta_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
-static int video_meta_start_streaming(struct vb2_queue *q, unsigned int count)
-{
-	return 0;
-}
-
-static void video_meta_stop_streaming(struct vb2_queue *q)
-{
-	struct camss_video *video = vb2_get_drv_priv(q);
-
-	video->ops->flush_buffers(video, VB2_BUF_STATE_ERROR);
-}
-
 static const struct vb2_ops msm_video_meta_vb2_q_ops = {
 	.queue_setup     = video_meta_queue_setup,
 	.buf_prepare     = video_meta_buf_prepare,
 	.buf_queue       = video_buf_queue,
 	.prepare_streaming = video_prepare_streaming,
-	.start_streaming = video_meta_start_streaming,
-	.stop_streaming  = video_meta_stop_streaming,
+	.start_streaming = video_start_streaming,
+	.stop_streaming  = video_stop_streaming,
 	.unprepare_streaming = video_unprepare_streaming,
 };
 
