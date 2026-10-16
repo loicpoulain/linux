@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/qcom-camss-config.h>
 
 #include "camss.h"
 #include "camss-vfe.h"
@@ -81,6 +82,16 @@
 #define		TFE_PP_CROP_LAST	GENMASK(13, 0)
 #define	TFE_PP_CROP_PIX_CFG				PP_CROP_REG(0x6C)
 
+#define BHIST_REG(a)					(0x1c00 + (a))
+#define TFE_BHIST_MODULE_CFG				BHIST_REG(0x60)
+#define		TFE_BHIST_MODULE_CFG_EN		BIT(0)
+#define TFE_BHIST_RGN_OFFSET_CFG			BHIST_REG(0x68)
+#define TFE_BHIST_RGN_NUM_CFG				BHIST_REG(0x6c)
+#define		TFE_BHIST_RGN_V			GENMASK(29, 16)
+#define		TFE_BHIST_RGN_H			GENMASK(13, 0)
+#define		TFE_BHIST_RGN_V_NUM		GENMASK(28, 16)
+#define		TFE_BHIST_RGN_H_NUM		GENMASK(12, 0)
+
 enum tfe_client {
 	TFE_CLI_BAYER,
 	TFE_CLI_IDEAL_RAW,
@@ -103,10 +114,16 @@ enum tfe_iface {
 	TFE_IFACE_NUM
 };
 
+/*
+ * Bus completion groups. A group fires once every write master in it has
+ * written its frame, so the clients sharing a group retire together:
+ * TINTLESS_BG and BHIST share TFE_SUBGROUP_BHIST, AWB_BG and AEC_BG share
+ * TFE_SUBGROUP_BG.
+ */
 enum tfe_subgroups {
 	TFE_SUBGROUP_BAYER,
 	TFE_SUBGROUP_IDEAL_RAW,
-	TFE_SUBGROUP_HDR,
+	TFE_SUBGROUP_BHIST,
 	TFE_SUBGROUP_BG,
 	TFE_SUBGROUP_BAF,
 	TFE_SUBGROUP_RDI0,
@@ -115,11 +132,26 @@ enum tfe_subgroups {
 	TFE_SUBGROUP_NUM
 };
 
-static enum tfe_client tfe_wm_client_map[VFE_LINE_NUM_MAX] = {
-	[VFE_LINE_RDI0] = TFE_CLI_RDI0,
-	[VFE_LINE_RDI1] = TFE_CLI_RDI1,
-	[VFE_LINE_RDI2] = TFE_CLI_RDI2,
-	[VFE_LINE_PIX] = TFE_CLI_BAYER,
+/*
+ * The write masters a line's outputs are described with. The first four are
+ * the line ids, as the generic code assigns a line's image output the line's
+ * own id; the ones after are free for the outputs a VFE enumerates itself.
+ */
+enum tfe_wm {
+	TFE_WM_RDI0 = VFE_LINE_RDI0,
+	TFE_WM_RDI1 = VFE_LINE_RDI1,
+	TFE_WM_RDI2 = VFE_LINE_RDI2,
+	TFE_WM_BAYER = VFE_LINE_PIX,
+	TFE_WM_STATS_BHIST,
+	TFE_WM_NUM
+};
+
+static enum tfe_client tfe_wm_client_map[TFE_WM_NUM] = {
+	[TFE_WM_RDI0] = TFE_CLI_RDI0,
+	[TFE_WM_RDI1] = TFE_CLI_RDI1,
+	[TFE_WM_RDI2] = TFE_CLI_RDI2,
+	[TFE_WM_BAYER] = TFE_CLI_BAYER,
+	[TFE_WM_STATS_BHIST] = TFE_CLI_STATS_BHIST,
 };
 
 static enum tfe_iface tfe_line_iface_map[VFE_LINE_NUM_MAX] = {
@@ -132,7 +164,7 @@ static enum tfe_iface tfe_line_iface_map[VFE_LINE_NUM_MAX] = {
 static enum vfe_line_id tfe_subgroup_line_map[TFE_SUBGROUP_NUM] = {
 	[TFE_SUBGROUP_BAYER] = VFE_LINE_PIX,
 	[TFE_SUBGROUP_IDEAL_RAW] = VFE_LINE_PIX,
-	[TFE_SUBGROUP_HDR] = VFE_LINE_PIX,
+	[TFE_SUBGROUP_BHIST] = VFE_LINE_PIX,
 	[TFE_SUBGROUP_BG] = VFE_LINE_PIX,
 	[TFE_SUBGROUP_BAF] = VFE_LINE_PIX,
 	[TFE_SUBGROUP_RDI0] = VFE_LINE_RDI0,
@@ -204,7 +236,9 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 
 		for (i = 0; i < TFE_SUBGROUP_NUM; i++) {
 			if (bus_status & TFE_BUS_IRQ_MASK_BUF_DONE(i)) {
-				struct camss_buf_done_info info = {};
+				struct camss_buf_done_info info = {
+					.status = BIT(i),
+				};
 
 				vfe_buf_done(vfe, __subgroup_to_line(i), &info);
 			}
@@ -252,11 +286,37 @@ static void vfe_enable_irq(struct vfe_device *vfe)
 	       TFE_BUS_IRQ_MASK_0_IMG_VIOL, vfe->base + TFE_BUS_IRQ_MASK_0);
 }
 
+static struct vfe_output *vfe_stats_output(struct vfe_line *line, u8 wm)
+{
+	unsigned int o;
+
+	if (!line->is_pix)
+		return NULL;
+
+	for (o = 1; o < line->num_outputs; o++)
+		if (line->output[o].pad == MSM_VFE_PAD_SRC_STATS &&
+		    line->output[o].wm_num &&
+		    line->output[o].wm[0].bus_client == wm)
+			return &line->output[o];
+
+	return NULL;
+}
+
 static void vfe_wm_update(struct vfe_device *vfe, u8 wm, struct camss_buffer *buffer,
 			  struct vfe_line *line)
 {
-	u32 addr = buffer->addr[0];
+	struct vfe_output *stats = vfe_stats_output(line, wm);
 	u8 client = tfe_wm_client_map[wm];
+	u32 addr;
+
+	/*
+	 * Each frame consumes one programmed address, as for images: hand the
+	 * write master the output's kernel buffer once per queued buffer.
+	 *
+	 * The write engine only takes 4K aligned addresses, which both a
+	 * coherent statistics buffer and an image buffer's IOVA are.
+	 */
+	addr = stats ? stats->dma_addr : buffer->addr[0];
 
 	writel_relaxed(addr, vfe->base + TFE_BUS_IMAGE_ADDR(client));
 }
@@ -284,14 +344,67 @@ static u32 vfe_packer_format(struct vfe_device *vfe, u32 pixelformat)
 	}
 }
 
+/*
+ * vfe_bhist_start - Enable the Bayer histogram over a line's cropped region
+ * @vfe: VFE device
+ * @line: VFE line
+ *
+ * The histogram runs on the uncropped stream and takes one sample per position
+ * of each 2x2 Bayer quad inside a region of its own, so the region is placed
+ * over the line's crop. Its offset is in pixels and its extent in quads,
+ * encoded one less than the number of quads it spans.
+ *
+ * The offset is rounded down to a whole quad: an odd offset would misalign the
+ * quads against the Bayer phase, which would shuffle the colours between the
+ * positions a sample is counted for.
+ *
+ * The bin a sample lands in comes from a piecewise mapping of the input range,
+ * described by a base and a slope per segment. Leaving every segment at zero
+ * spans the whole input range uniformly over the CAMSS_STATS_BHIST_QUAD_BINS
+ * bins, which is what a histogram of the raw input wants.
+ */
+static void vfe_bhist_start(struct vfe_device *vfe, struct vfe_line *line)
+{
+	struct v4l2_rect *crop = &line->crop;
+	u32 h_num = max(crop->width / 2, 1U) - 1;
+	u32 v_num = max(crop->height / 2, 1U) - 1;
+	unsigned int i;
+
+	writel_relaxed(FIELD_PREP(TFE_BHIST_RGN_V, crop->top & ~1) |
+		       FIELD_PREP(TFE_BHIST_RGN_H, crop->left & ~1),
+		       vfe->base + TFE_BHIST_RGN_OFFSET_CFG);
+	writel_relaxed(FIELD_PREP(TFE_BHIST_RGN_V_NUM, v_num) |
+		       FIELD_PREP(TFE_BHIST_RGN_H_NUM, h_num),
+		       vfe->base + TFE_BHIST_RGN_NUM_CFG);
+
+	writel(TFE_BHIST_MODULE_CFG_EN, vfe->base + TFE_BHIST_MODULE_CFG);
+
+	dev_dbg(vfe->camss->dev, "VFE%u: BHIST over %ux%u quads at %u,%u\n",
+		vfe->id, h_num + 1, v_num + 1, crop->left & ~1, crop->top & ~1);
+}
+
 static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 {
 	struct v4l2_pix_format_mplane *pix = &line->output[0].video_out.active_fmt.fmt.pix_mp;
+	struct vfe_output *stats = vfe_stats_output(line, wm);
 	u32 stride = pix->plane_fmt[0].bytesperline;
 	u8 client = tfe_wm_client_map[wm];
 	u32 cfg = TFE_BUS_CLIENT_CFG_EN;
 
-	if (client == TFE_CLI_BAYER) { /* PIX - Line based */
+	if (stats) { /* Statistics - Frame based, one fixed size blob per frame */
+		writel_relaxed(TFE_BUS_IMAGE_CFG_0_DEFAULT,
+			       vfe->base + TFE_BUS_IMAGE_CFG_0(client));
+		writel_relaxed(0u, vfe->base + TFE_BUS_IMAGE_CFG_1(client));
+		writel_relaxed(TFE_BUS_IMAGE_CFG_2_DEFAULT,
+			       vfe->base + TFE_BUS_IMAGE_CFG_2(client));
+		writel_relaxed(stats->dma_size, vfe->base + TFE_BUS_FRAME_INCR(client));
+		writel_relaxed(TFE_BUS_PACKER_CFG_FMT_PLAIN64,
+			       vfe->base + TFE_BUS_PACKER_CFG(client));
+		cfg |= TFE_BUS_CLIENT_CFG_MODE_FRAME;
+
+		if (client == TFE_CLI_STATS_BHIST)
+			vfe_bhist_start(vfe, line);
+	} else if (client == TFE_CLI_BAYER) { /* PIX - Line based */
 		struct v4l2_rect *crop = &line->crop;
 
 		/* Cropping */
@@ -345,6 +458,9 @@ static void vfe_wm_stop(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 
 	writel(0, vfe->base + TFE_BUS_CLIENT_CFG(client));
 
+	if (client == TFE_CLI_STATS_BHIST)
+		writel(0, vfe->base + TFE_BHIST_MODULE_CFG);
+
 	dev_dbg(vfe->camss->dev, "VFE%u: Stopped client %u\n", vfe->id, client);
 }
 
@@ -355,7 +471,23 @@ static const struct camss_video_ops vfe_video_ops_520 = {
 
 static void vfe_subdev_init(struct device *dev, struct vfe_device *vfe)
 {
+	struct vfe_line *pix = &vfe->line[VFE_LINE_PIX];
+	const u8 bayer_wm = TFE_WM_BAYER;
+
 	vfe->video_ops = vfe_video_ops_520;
+
+	vfe_add_rdi(&vfe->line[VFE_LINE_RDI0].output[0], TFE_WM_RDI0, TFE_SUBGROUP_RDI0);
+	vfe_add_rdi(&vfe->line[VFE_LINE_RDI1].output[0], TFE_WM_RDI1, TFE_SUBGROUP_RDI1);
+	vfe_add_rdi(&vfe->line[VFE_LINE_RDI2].output[0], TFE_WM_RDI2, TFE_SUBGROUP_RDI2);
+
+	/* The pixel line writes the Bayer image and the Bayer histogram */
+	vfe_add_output(&pix->output[0], MSM_VFE_PAD_SRC, TFE_SUBGROUP_BAYER, 1, &bayer_wm);
+	vfe_add_stats(&pix->output[1], TFE_WM_STATS_BHIST, TFE_SUBGROUP_BHIST,
+		      CAMSS_STATS_BHIST);
+	if (vfe_alloc_stats(vfe, &pix->output[1]))
+		pix->output[1].wm_num = 0;	/* no statistics without their buffer */
+
+	vfe_set_pix(pix, 2);
 }
 
 static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
