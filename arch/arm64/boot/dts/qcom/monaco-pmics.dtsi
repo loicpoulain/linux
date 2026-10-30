@@ -58,6 +58,7 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			#io-channel-cells = <1>;
+			#thermal-sensor-cells = <1>;
 
 			channel@3 {
 				reg = <ADC5_GEN3_DIE_TEMP(0)>;
@@ -112,6 +113,7 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			#io-channel-cells = <1>;
+			#thermal-sensor-cells = <1>;
 
 			channel@203 {
 				reg = <ADC5_GEN3_DIE_TEMP(2)>;
