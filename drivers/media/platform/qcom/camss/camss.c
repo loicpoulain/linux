@@ -5834,6 +5834,8 @@ static const struct of_device_id camss_dt_match[] = {
 
 MODULE_DEVICE_TABLE(of, camss_dt_match);
 
+#define CAMSS_CPU_LATENCY_US	300
+
 static int __maybe_unused camss_runtime_suspend(struct device *dev)
 {
 	struct camss *camss = dev_get_drvdata(dev);
@@ -5845,6 +5847,8 @@ static int __maybe_unused camss_runtime_suspend(struct device *dev)
 		if (ret)
 			return ret;
 	}
+
+	cpu_latency_qos_remove_request(&camss->cpu_latency);
 
 #if IS_ENABLED(CONFIG_PM_CLK)
 	return pm_clk_suspend(dev);
@@ -5866,12 +5870,17 @@ static int __maybe_unused camss_runtime_resume(struct device *dev)
 		return ret;
 #endif
 
+	cpu_latency_qos_add_request(&camss->cpu_latency,
+				    CAMSS_CPU_LATENCY_US);
+
 	for (i = 0; i < camss->res->icc_path_num; i++) {
 		ret = icc_set_bw(camss->icc_path[i],
 				 icc_res[i].icc_bw_tbl.avg,
 				 icc_res[i].icc_bw_tbl.peak);
-		if (ret)
+		if (ret) {
+			cpu_latency_qos_remove_request(&camss->cpu_latency);
 			return ret;
+		}
 	}
 
 	return 0;
