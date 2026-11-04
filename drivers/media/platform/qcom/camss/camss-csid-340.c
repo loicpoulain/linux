@@ -22,6 +22,12 @@
 #define		CSID_RST_PHY_CLK			BIT(3)
 #define		CSID_RST_CSID_CLK			BIT(4)
 
+/* Per-interface IRQ block, indexed by enum csid_iface */
+#define CSID_IFACE_IRQ_STATUS(iface)				(0x030 + 0x10 * (iface))
+#define CSID_IFACE_IRQ_MASK(iface)				(0x034 + 0x10 * (iface))
+#define		CSID_IFACE_IRQ_INFO_INPUT_SOF		BIT(12)
+#define CSID_IFACE_IRQ_CLEAR(iface)				(0x038 + 0x10 * (iface))
+
 #define CSID_IRQ_STATUS						(0x070)
 #define CSID_IRQ_MASK						(0x074)
 #define		CSID_IRQ_MASK_RST_DONE			BIT(0)
@@ -83,6 +89,17 @@ static void __csid_configure_rx(struct csid_device *csid, struct csid_phy_config
 	writel_relaxed(val, csid->base + CSID_CSI2_RX_CFG1);
 }
 
+static void __csid_configure_iface_irq(struct csid_device *csid, u8 enable,
+				       enum csid_iface iface)
+{
+	u32 val = 0;
+
+	if (enable)
+		val = CSID_IFACE_IRQ_INFO_INPUT_SOF;
+
+	writel_relaxed(val, csid->base + CSID_IFACE_IRQ_MASK(iface));
+}
+
 static void __csid_configure_stream(struct csid_device *csid, u8 enable, u8 port, u8 vc)
 {
 	struct v4l2_mbus_framefmt *input_format = &csid->fmt[MSM_CSID_PAD_FIRST_SRC + port];
@@ -125,6 +142,7 @@ static void __csid_configure_stream(struct csid_device *csid, u8 enable, u8 port
 		format->decode_format, port, vc);
 
 	writel_relaxed(val, csid->base + CSID_CFG0(iface));
+	__csid_configure_iface_irq(csid, enable, iface);
 	writel_relaxed(enable, csid->base + CSID_CTRL(iface));
 }
 
@@ -169,15 +187,34 @@ static int csid_reset(struct csid_device *csid)
 static irqreturn_t csid_isr(int irq, void *dev)
 {
 	struct csid_device *csid = dev;
+	u32 iface_val = 0;
 	u32 val;
+	int i;
 
 	val = readl_relaxed(csid->base + CSID_IRQ_STATUS);
 	writel_relaxed(val, csid->base + CSID_IRQ_CLEAR);
+
+	/* Read and clear the IRQ status of each enabled interface */
+	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++) {
+		enum csid_iface iface = csid_port_iface_map[i];
+		u32 status;
+
+		if (!(csid->phy.en_vc & BIT(i)))
+			continue;
+
+		status = readl_relaxed(csid->base + CSID_IFACE_IRQ_STATUS(iface));
+		writel_relaxed(status, csid->base + CSID_IFACE_IRQ_CLEAR(iface));
+		iface_val |= status;
+
+		if (status & CSID_IFACE_IRQ_INFO_INPUT_SOF)
+			csid_sof_event(csid, i);
+	}
+
 	writel_relaxed(CSID_IRQ_CMD_CLEAR, csid->base + CSID_IRQ_CMD);
 
 	if (val & CSID_IRQ_MASK_RST_DONE)
 		complete(&csid->reset_complete);
-	else
+	else if (!iface_val)
 		dev_warn_ratelimited(csid->camss->dev, "Spurious CSID interrupt\n");
 
 	return IRQ_HANDLED;
