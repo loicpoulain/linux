@@ -380,8 +380,15 @@ int iris_venc_s_selection(struct iris_inst *inst, struct v4l2_selection *s)
 		s->r.left = 0;
 		s->r.top = 0;
 
-		if (s->r.width > inst->fmt_src->fmt.pix_mp.width ||
-		    s->r.height > inst->fmt_src->fmt.pix_mp.height)
+		/*
+		 * The crop rectangle lives in the same coordinate space as the
+		 * raw resolution reported to the firmware, so it must be bound
+		 * by that and not by the padded buffer resolution. Bounding it
+		 * by fmt_src would let userspace pick a rectangle larger than
+		 * the source frame and underflow the HFI crop offsets.
+		 */
+		if (s->r.width > inst->enc_raw_width ||
+		    s->r.height > inst->enc_raw_height)
 			return -EINVAL;
 
 		inst->crop.left = s->r.left;
